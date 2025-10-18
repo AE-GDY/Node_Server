@@ -35,7 +35,8 @@ const METRICS = { totalRetries: 0, totalTimeouts: 0, byTF: {} };
 // ==== POOL HELPER ====
 async function mapPool(items, limit, worker) {
   const results = new Array(items.length);
-  let idx = 0, active = 0;
+  let idx = 0,
+    active = 0;
   return new Promise((resolve) => {
     const launchNext = () => {
       if (idx >= items.length && active === 0) return resolve(results);
@@ -44,9 +45,16 @@ async function mapPool(items, limit, worker) {
         active++;
         sleep(jitter()).then(() =>
           Promise.resolve(worker(items[current], current))
-            .then((res) => { results[current] = res; })
-            .catch((err) => { results[current] = err; })
-            .finally(() => { active--; launchNext(); })
+            .then((res) => {
+              results[current] = res;
+            })
+            .catch((err) => {
+              results[current] = err;
+            })
+            .finally(() => {
+              active--;
+              launchNext();
+            })
         );
       }
     };
@@ -54,31 +62,12 @@ async function mapPool(items, limit, worker) {
   });
 }
 
-function waitForFirstUpdate(chart) {
-  return new Promise((resolve, reject) => {
-    let resolved = false;
-    const done = (periods) => {
-      if (resolved) return;
-      resolved = true;
-      resolve(periods || []);
-    };
-    chart.onUpdate(() => done(chart.periods || []));
-    if (typeof chart.onError === "function") {
-      chart.onError((e) => {
-        if (!resolved) {
-          resolved = true;
-          reject(e || new Error("chart update error"));
-        }
-      });
-    }
-  });
-}
-
 // ==== CORE FETCHERS ====
 async function fetchTickerTF(client, ticker, tf, barsNeeded, tfName) {
   const pretty = `${ticker} ${tf}`;
   const range = Math.min(barsNeeded + 10, 10000);
-  let attempt = 0, lastErr = null;
+  let attempt = 0,
+    lastErr = null;
   if (!METRICS.byTF[tfName]) METRICS.byTF[tfName] = { retries: 0, timeouts: 0 };
 
   while (attempt < MAX_RETRIES) {
@@ -92,9 +81,7 @@ async function fetchTickerTF(client, ticker, tf, barsNeeded, tfName) {
       chart.setMarket(MARKET_SYM(ticker), { timeframe: tf, range });
 
       const timeoutPromise = new Promise((_, reject) => {
-        timeoutHandle = setTimeout(() => {
-          reject(new Error("timeout"));
-        }, TIMEOUT_MS);
+        timeoutHandle = setTimeout(() => reject(new Error("timeout")), TIMEOUT_MS);
       });
 
       const updatePromise = new Promise((resolve, reject) => {
@@ -116,16 +103,55 @@ async function fetchTickerTF(client, ticker, tf, barsNeeded, tfName) {
       });
 
       const periods = await Promise.race([updatePromise, timeoutPromise]);
+      try {
+        chart.delete();
+      } catch {}
 
-      try { chart.delete(); } catch {}
+      if (!periods || periods.length === 0) throw new Error("no-data");
 
-      if (!periods || periods.length === 0)
-        throw new Error("no-data");
+      // ✅ Sort by time ascending
+      const sortedPeriods = periods.sort((a, b) => a.time - b.time);
 
-      const closes = periods.slice(-barsNeeded).map((p) => p.close);
-      console.log(`  ✓ ${pretty}: ${closes.length}/${barsNeeded} bars`);
-      return closes;
+      let recentBars;
 
+      // ✅ Only apply "latest trading day" filter for intraday timeframes
+      // const intradayTFs = ["1", "3", "5", "15", "30", "45", "60", "120", "240"];
+      if (tf === "5") {
+        const latestTimestamp = sortedPeriods[sortedPeriods.length - 1].time * 1000;
+        const latestDate = new Date(latestTimestamp);
+        const latestDateStr = latestDate.toISOString().split("T")[0]; // "YYYY-MM-DD"
+
+        const sameDayPeriods = sortedPeriods.filter((p) => {
+          const dateStr = new Date(p.time * 1000).toISOString().split("T")[0];
+          return dateStr === latestDateStr;
+        });
+
+        recentBars = sameDayPeriods.slice(-barsNeeded);
+      } else {
+        // ✅ Daily / Weekly / etc.: Keep full history
+        recentBars = sortedPeriods.slice(-barsNeeded);
+      }
+
+      // ✅ Format each time like "2025-10-16 9:15 AM"
+      const dataPoints = recentBars.map((p) => {
+        const date = new Date(p.time * 1000);
+        const formattedTime = date
+          .toLocaleString("en-US", {
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "numeric",
+            minute: "2-digit",
+            hour12: true,
+            timeZone: "UTC",
+          })
+          .replace(",", "")
+          .replace(/(\d+)\/(\d+)\/(\d+)/, (_, m, d, y) => `${y}-${m}-${d}`);
+        return { time: formattedTime, close: p.close };
+      });
+
+      console.log(`  ✓ ${pretty}: ${dataPoints.length}/${barsNeeded} bars`);
+      return dataPoints;
     } catch (e) {
       lastErr = e;
       const msg = (e?.message || "").toLowerCase();
@@ -135,12 +161,18 @@ async function fetchTickerTF(client, ticker, tf, barsNeeded, tfName) {
       if (msg.includes("timeout")) {
         METRICS.totalTimeouts++;
         METRICS.byTF[tfName].timeouts++;
-        console.warn(`  ⚠️ RETRY (timeout) — ${ticker} ${tf} attempt ${attempt}/${MAX_RETRIES}`);
+        console.warn(
+          `  ⚠️ RETRY (timeout) — ${ticker} ${tf} attempt ${attempt}/${MAX_RETRIES}`
+        );
       } else {
-        console.warn(`  ⚠️ RETRY (${e.message}) — ${ticker} ${tf} attempt ${attempt}/${MAX_RETRIES}`);
+        console.warn(
+          `  ⚠️ RETRY (${e.message}) — ${ticker} ${tf} attempt ${attempt}/${MAX_RETRIES}`
+        );
       }
 
-      try { if (chart) chart.delete(); } catch {}
+      try {
+        if (chart) chart.delete();
+      } catch {}
       clearTimeout(timeoutHandle);
 
       const backoff = INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1);
@@ -148,7 +180,9 @@ async function fetchTickerTF(client, ticker, tf, barsNeeded, tfName) {
     }
   }
 
-  console.warn(`  ❌ ${pretty} failed after ${MAX_RETRIES} attempts (${lastErr?.message || lastErr})`);
+  console.warn(
+    `  ❌ ${pretty} failed after ${MAX_RETRIES} attempts (${lastErr?.message || lastErr})`
+  );
   return [];
 }
 
@@ -156,15 +190,15 @@ async function processTimeframe(client, { tf, name, bars, idx }, tickers) {
   console.log(`\n▶ ${name} (${tf}) — last ${bars} bars [tickers x${tickers.length}]`);
   const data = {};
   await mapPool(tickers, TICKER_CONCURRENCY, async (ticker) => {
-    const closes = await fetchTickerTF(client, ticker, tf, bars, name);
-    data[ticker] = closes;
+    const result = await fetchTickerTF(client, ticker, tf, bars, name);
+    data[ticker] = result;
   });
   return { idx, name, data };
 }
 
 async function fetchEGXData(client, tickers) {
   const t0 = Date.now();
-  const tfConcurrency = tickers.length === 1 ? 1 : TF_CONCURRENCY; // 🟢 dynamic concurrency
+  const tfConcurrency = TF_CONCURRENCY;
 
   const tfResults = await mapPool(TIMEFRAMES, tfConcurrency, (tfInfo) =>
     processTimeframe(client, tfInfo, tickers)
@@ -185,7 +219,7 @@ async function fetchEGXData(client, tickers) {
 
 // ==== POST ENDPOINT ====
 app.post("/fetch_egx_data", async (req, res) => {
-  const client = new TradingView.Client({}); // 🟢 isolate per request
+  const client = new TradingView.Client({}); // isolate per request
 
   try {
     const tickers = req.body.tickers;
@@ -196,7 +230,7 @@ app.post("/fetch_egx_data", async (req, res) => {
 
     console.log(`📡 Fetching data for ${tickers.length} tickers: ${tickers.join(", ")}`);
 
-    // 🟢 Global timeout failsafe
+    // Global timeout failsafe
     const json = await Promise.race([
       fetchEGXData(client, tickers),
       new Promise((_, reject) =>
@@ -209,7 +243,9 @@ app.post("/fetch_egx_data", async (req, res) => {
     console.error("❌ Error in fetch_egx_data:", e);
     res.status(500).json({ error: e.message });
   } finally {
-    try { client.end(); } catch {}
+    try {
+      client.end();
+    } catch {}
   }
 });
 
