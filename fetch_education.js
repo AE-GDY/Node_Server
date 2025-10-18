@@ -14,12 +14,12 @@ const PORT = process.env.PORT || 8080;
 // ==== CONFIG ====
 const MARKET_SYM = (t) => `EGX:${t}`;
 const TIMEFRAMES = [
-  { tf: "5", name: "5 Minutes", bars: 54 },
-  { tf: "15", name: "15 Minutes", bars: 90 },
-  { tf: "60", name: "1 Hour", bars: 105 },
-  { tf: "1D", name: "Daily", bars: 120 },
-  { tf: "1W", name: "Weekly_52", bars: 52 },
-  { tf: "1W", name: "Weekly_260", bars: 260 },
+  { tf: "5", name: "one_day", bars: 54 },
+  { tf: "15", name: "one_week", bars: 90 },
+  { tf: "60", name: "one_month", bars: 105 },
+  { tf: "1D", name: "six_months", bars: 120 },
+  { tf: "1W", name: "one_year", bars: 52 },
+  { tf: "1W", name: "five_years", bars: 260 },
 ].map((t, i) => ({ ...t, idx: i }));
 
 const TF_CONCURRENCY = Number(process.env.TF_CONCURRENCY || 6);
@@ -251,4 +251,5 @@ app.post("/fetch_egx_data", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
+
 });
