@@ -171,18 +171,44 @@ function pickOnOrAfterStartIndex(rows, cutoff) {
   for (let i = 0; i < rows.length; i++) if (DH.ymd(rows[i]._ts) >= cutoff) return i;
   return rows.length - 1;
 }
+
 function filterWindow(rows, key) {
   if (!rows.length) return rows;
   const last = rows.at(-1);
   const lastLocal = new Date(last._ts);
-  const sliceFrom = (cutoff) => rows.slice(pickOnOrAfterStartIndex(rows, cutoff));
+
+  const sliceFrom = (cutoff) => {
+    const idx = pickOnOrAfterStartIndex(rows, cutoff);
+    // Always include one bar before cutoff (if available)
+    return idx > 0 ? rows.slice(idx - 1) : rows;
+  };
 
   switch (key) {
-    case "one_day":   return rows.filter(r => DH.ymd(r._ts) === DH.ymd(last._ts));
-    case "one_week":  return sliceFrom(DH.ymd(DH.addDays(lastLocal, -6)));
-    case "one_month": return sliceFrom(DH.ymd(DH.addDays(lastLocal, -30)));
-    case "six_months":return sliceFrom(DH.ymd(DH.addMonths(lastLocal, -6)));
-    default:          return rows;
+    case "one_day": {
+      const cutoff = DH.ymd(last._ts); // same day as last
+      // Include all data from that day + one previous bar
+      const filtered = rows.filter(r => DH.ymd(r._ts) === cutoff);
+      const firstIdx = rows.findIndex(r => r === filtered[0]);
+      return firstIdx > 0 ? rows.slice(firstIdx - 1) : filtered;
+    }
+
+    case "one_week": {
+      const cutoff = DH.ymd(DH.addDays(lastLocal, -6));
+      return sliceFrom(cutoff);
+    }
+
+    case "one_month": {
+      const cutoff = DH.ymd(DH.addDays(lastLocal, -30));
+      return sliceFrom(cutoff);
+    }
+
+    case "six_months": {
+      const cutoff = DH.ymd(DH.addMonths(lastLocal, -6));
+      return sliceFrom(cutoff);
+    }
+
+    default:
+      return rows;
   }
 }
 
@@ -516,4 +542,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 
 });
+
 
