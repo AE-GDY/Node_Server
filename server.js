@@ -102,6 +102,7 @@ async function fetchBarsOnce(symbol, { timeframe, range, toUnix }) {
       console.log(`✅ Success ${symbol} [tf=${timeframe}] in ${Date.now()-t0} ms (attempt ${attempt}/${MAX_RETRIES})`);
       return periods;
     } catch (e) {
+      console.log(`error catched: ${e}`)
       try { if (chart) chart.delete(); } catch {}
       if (attempt >= MAX_RETRIES) {
         console.log(`❌ FAILED ${symbol} [tf=${timeframe}] after ${attempt} attempts (last error: ${e.message || e})`);
