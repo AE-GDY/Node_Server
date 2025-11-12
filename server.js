@@ -970,8 +970,16 @@ if (includeEGX30 && combined["5Y_EGX30_ONLY_Daily_Union"]) {
 //console.log(`💾 Saved JSON  → ${OUT_JSON}`);
 res.json(jsonPerTicker);
 console.log(`✅ ALL DONE in ${((Date.now()-startAll)/1000).toFixed(2)} s`);
-console.log("After building:", process.memoryUsage().heapUsed / 1024 / 1024, "MB");
-console.log("RSS After building:", (process.memoryUsage().rss / 1024 / 1024).toFixed(2), "MB");
+//console.log("After building:", process.memoryUsage().heapUsed / 1024 / 1024, "MB");
+//console.log("RSS After building:", (process.memoryUsage().rss / 1024 / 1024).toFixed(2), "MB");
+const used = process.memoryUsage();
+console.log({
+  rss: (used.rss / 1024 / 1024).toFixed(2) + " MB",
+  heapTotal: (used.heapTotal / 1024 / 1024).toFixed(2) + " MB",
+  heapUsed: (used.heapUsed / 1024 / 1024).toFixed(2) + " MB",
+  external: (used.external / 1024 / 1024).toFixed(2) + " MB",
+  arrayBuffers: (used.arrayBuffers / 1024 / 1024).toFixed(2) + " MB"
+});
 });
 
 const used = process.memoryUsage();
