@@ -876,34 +876,6 @@ if (includeEGX30) {
   });
   let combined = Object.assign({}, ...allTables);
 
-  // Save XLSX
-  /*
-  const wb = XLSX.utils.book_new();
-  for (const [name, table] of Object.entries(combined)) {
-  if (!Array.isArray(table) || !Array.isArray(table[0])) {
-    console.warn(`⏭️  Skipping sheet "${name}" — not a 2D array (job may have failed).`);
-    continue;
-  }
-
-  // ✅ shorten long sheet names
-  let sheetName = name;
-  if (sheetName.length > 31) {
-    // custom mapping
-    if (sheetName === "5Y_EGX30_ONLY_Daily_Union") {
-      sheetName = "5Y_EGX30_ONLY_DU"; // <= 31 chars
-    } else {
-      sheetName = sheetName.substring(0, 31);
-    }
-  }
-
-  console.log(`📝 Writing sheet: ${sheetName}  (rows=${table.length-1}, cols=${table[0].length})`);
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(table), sheetName);
-}
-  */
-
-  //XLSX.writeFile(wb, OUT_XLSX);
-  //console.log(`💾 Saved Excel → ${OUT_XLSX}`);
-
   // ===== JSON export (keep future points for 1D/1W/1M as 0) =====
 const jsonPerTicker = tickers.map(tk => {
   const base = {
@@ -955,7 +927,7 @@ function pushSeries(tableName, jsonKey, includeNullsAsZero = false) {
 console.log(`🧩 Building JSON export`);
 if (combined["1D_1min_Union"]) pushSeries("1D_1min_Union", "one_day", true);          // keep future minutes as 0
 pushSeries("1W_15min_Union",        "one_week",          true);                        // keep future 15m as 0
-pushSeries("1M_Hourly_Union",       "one_month",         true);                        // keep future hourly as 0
+pushSeries("1M_Hourly_Union",       "one_month",         true);
 pushSeries("6M_Daily_Union",        "six_months",        false);
 pushSeries("1Y_Weekly_Downsampled", "one_year",          false);
 pushSeries("5Y_Weekly_Downsampled", "five_years",        false);
@@ -965,9 +937,6 @@ if (includeEGX30 && combined["5Y_EGX30_ONLY_Daily_Union"]) {
   pushSeries("5Y_EGX30_ONLY_Daily_Union", "five_years_daily", false);
 }
 
-
-//fs.writeFileSync(OUT_JSON, JSON.stringify(jsonPerTicker, null, 2), "utf8");
-//console.log(`💾 Saved JSON  → ${OUT_JSON}`);
 res.json(jsonPerTicker);
 console.log(`✅ ALL DONE in ${((Date.now()-startAll)/1000).toFixed(2)} s`);
 //console.log("After building:", process.memoryUsage().heapUsed / 1024 / 1024, "MB");
