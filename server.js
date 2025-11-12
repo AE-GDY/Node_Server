@@ -898,8 +898,8 @@ if (includeEGX30) {
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(table), sheetName);
 }
 
-  XLSX.writeFile(wb, OUT_XLSX);
-  console.log(`💾 Saved Excel → ${OUT_XLSX}`);
+  //XLSX.writeFile(wb, OUT_XLSX);
+  //console.log(`💾 Saved Excel → ${OUT_XLSX}`);
 
   // ===== JSON export (keep future points for 1D/1W/1M as 0) =====
 const jsonPerTicker = tickers.map(tk => {
@@ -963,8 +963,8 @@ if (includeEGX30 && combined["5Y_EGX30_ONLY_Daily_Union"]) {
 }
 
 
-fs.writeFileSync(OUT_JSON, JSON.stringify(jsonPerTicker, null, 2), "utf8");
-console.log(`💾 Saved JSON  → ${OUT_JSON}`);
+//fs.writeFileSync(OUT_JSON, JSON.stringify(jsonPerTicker, null, 2), "utf8");
+//console.log(`💾 Saved JSON  → ${OUT_JSON}`);
 res.json(jsonPerTicker);
 
 
