@@ -776,6 +776,7 @@ app.use(express.json());
 app.post('/fetch',async (req, res)=>{
 
   console.log("Before building:", process.memoryUsage().heapUsed / 1024 / 1024, "MB");
+  console.log("RSS Before building:", (process.memoryUsage().rss / 1024 / 1024).toFixed(2), "MB");
 
   const startAll = Date.now();
   logEnvCheck();
@@ -970,6 +971,7 @@ if (includeEGX30 && combined["5Y_EGX30_ONLY_Daily_Union"]) {
 res.json(jsonPerTicker);
 console.log(`✅ ALL DONE in ${((Date.now()-startAll)/1000).toFixed(2)} s`);
 console.log("After building:", process.memoryUsage().heapUsed / 1024 / 1024, "MB");
+console.log("RSS After building:", (process.memoryUsage().rss / 1024 / 1024).toFixed(2), "MB");
 });
 
 const used = process.memoryUsage();
