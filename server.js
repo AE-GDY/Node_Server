@@ -775,7 +775,7 @@ app.use(express.json());
 // ===== MAIN =====
 app.post('/fetch',async (req, res)=>{
 
-  console.log("STARTED HERE");
+  console.log("Before building:", process.memoryUsage().heapUsed / 1024 / 1024, "MB");
 
   const startAll = Date.now();
   logEnvCheck();
@@ -876,6 +876,7 @@ if (includeEGX30) {
   let combined = Object.assign({}, ...allTables);
 
   // Save XLSX
+  /*
   const wb = XLSX.utils.book_new();
   for (const [name, table] of Object.entries(combined)) {
   if (!Array.isArray(table) || !Array.isArray(table[0])) {
@@ -897,6 +898,7 @@ if (includeEGX30) {
   console.log(`📝 Writing sheet: ${sheetName}  (rows=${table.length-1}, cols=${table[0].length})`);
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(table), sheetName);
 }
+  */
 
   //XLSX.writeFile(wb, OUT_XLSX);
   //console.log(`💾 Saved Excel → ${OUT_XLSX}`);
@@ -966,12 +968,15 @@ if (includeEGX30 && combined["5Y_EGX30_ONLY_Daily_Union"]) {
 //fs.writeFileSync(OUT_JSON, JSON.stringify(jsonPerTicker, null, 2), "utf8");
 //console.log(`💾 Saved JSON  → ${OUT_JSON}`);
 res.json(jsonPerTicker);
-
-
-  console.log(`✅ ALL DONE in ${((Date.now()-startAll)/1000).toFixed(2)} s`);
-  //try{ client.end(); }catch{}
+console.log(`✅ ALL DONE in ${((Date.now()-startAll)/1000).toFixed(2)} s`);
+console.log("After building:", process.memoryUsage().heapUsed / 1024 / 1024, "MB");
 });
 
+const used = process.memoryUsage();
+console.log(`🧠 Memory usage:
+  RSS: ${(used.rss / 1024 / 1024).toFixed(2)} MB
+  Heap Used: ${(used.heapUsed / 1024 / 1024).toFixed(2)} MB
+`);
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
