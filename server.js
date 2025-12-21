@@ -34,8 +34,8 @@ app.use(express.json());
 
 // ===== CONFIG =====
 const MARKET_SYM = (t) => (String(t).includes(":") ? String(t) : `EGX:${t}`);
-const TICKER_CONCURRENCY = Number(process.env.TICKER_CONCURRENCY || 6);
-const TF_CONCURRENCY     = Number(process.env.TF_CONCURRENCY     || 1);
+const TICKER_CONCURRENCY = Number(process.env.TICKER_CONCURRENCY || 20);
+const TF_CONCURRENCY     = Number(process.env.TF_CONCURRENCY     || 6);
 
 const TIMEOUT_DAILY_MS     = Number(process.env.TIMEOUT_DAILY_MS || 12000);
 const TIMEOUT_INTRADAY_MS  = Number(process.env.TIMEOUT_INTRADAY_MS || 12000);
