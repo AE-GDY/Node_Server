@@ -966,6 +966,7 @@ app.post("/fetch", async (req, res) => {
 
   console.log("SESSION:", process.env.SESSION?.slice(0, 6), "...", process.env.SESSION?.length);
   console.log("SIGNATURE:", process.env.SIGNATURE?.slice(0, 6), "...", process.env.SIGNATURE?.length);
+  console.log('PID:', process.pid);
 
   return withRequestLock(async () => {
     const clientRef = { tv: createTvClient() };
