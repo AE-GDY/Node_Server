@@ -1,6 +1,7 @@
 {
   "name": "tradingview-egx",
   "version": "1.0.0",
+  "type": "module",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -12,6 +13,8 @@
   "dependencies": {
     "@mathieuc/tradingview": "^3.5.2",
     "dotenv": "^17.2.3",
+    "cors": "^2.8.5",
+    "microsoft-cognitiveservices-speech-sdk": "^1.47.0",
     "express": "^5.1.0",
     "luxon": "^3.7.2",
     "pm2": "^6.0.13",
