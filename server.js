@@ -1,23 +1,3 @@
-/**
- *
- * Goals (per your requirement: cannot skip any data):
- * ✅ Never “deadline skip” any ticker/window
- * ✅ Mimic “Render restart behavior” internally:
- *    - Fresh TradingView client per request
- *    - On recoverable errors (timeouts/ws), recreate client and retry
- *    - Always cleanup charts + client at end of request
- * ✅ Prevent overlapping /fetch requests (mutex) to avoid WS overload
- *
- * Env Vars recommended on Render:
- *   SESSION, SIGNATURE
- *   TF_CONCURRENCY=1
- *   TICKER_CONCURRENCY=5 (or 6)
- *   TIMEOUT_DAILY_MS=12000
- *   TIMEOUT_INTRADAY_MS=12000
- *   MAX_RETRIES=3
- *   INITIAL_BACKOFF_MS=500
- */
-
 const fs = require("fs");
 const path = require("path");
 const XLSX = require("xlsx");
@@ -27,9 +7,13 @@ console.log("CWD:", process.cwd());
 console.log("SESSION length:", (process.env.SESSION || "").length);
 console.log("SIGNATURE length:", (process.env.SIGNATURE || "").length);
 const TradingView = require("@mathieuc/tradingview");
+const speechsdk = require("microsoft-cognitiveservices-speech-sdk");
 
 const express = require("express");
 const app = express();
+const cors = require("cors");
+
+app.use(cors());
 app.use(express.json());
 
 // ===== CONFIG =====
@@ -1066,6 +1050,100 @@ app.post("/fetch", async (req, res) => {
       destroyTvClient(clientRef.tv);
     }
   });
+});
+
+function ticksToMs(ticks) {
+  // 1 tick = 100ns → 10,000 ticks = 1 ms
+  return Math.round(Number(ticks) / 10000);
+}
+
+app.post("/tts", async (req, res) => {
+  try {
+    const text = String(req.body.text || "").trim();
+    if (!text) {
+      return res.status(400).json({ ok: false, error: "text is required" });
+    }
+
+    const voice  = String(req.body.voice || "en-US-SaraNeural");
+    const format = String(req.body.format || "wav"); // wav = best sync
+
+    const key    = process.env.AZURE_SPEECH_KEY;
+    const region = process.env.AZURE_SPEECH_REGION;
+
+    if (!key || !region) {
+      return res.status(500).json({
+        ok: false,
+        error: "AZURE_SPEECH_KEY or AZURE_SPEECH_REGION missing",
+      });
+    }
+
+    const speechConfig = speechsdk.SpeechConfig.fromSubscription(key, region);
+    speechConfig.speechSynthesisVoiceName = voice;
+
+    // WAV avoids decoder latency → minimal drift with timestamps
+    if (format === "wav") {
+      speechConfig.speechSynthesisOutputFormat =
+        speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm;
+    } else {
+      speechConfig.speechSynthesisOutputFormat =
+        speechsdk.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3;
+    }
+
+    const synthesizer = new speechsdk.SpeechSynthesizer(speechConfig);
+
+    const speechMarks = [];
+    synthesizer.wordBoundary = (_, e) => {
+      const start = typeof e.textOffset === "number" ? e.textOffset : -1;
+      const len   = typeof e.wordLength === "number" ? e.wordLength : 0;
+      const end   = start >= 0 ? start + len : -1;
+
+      const value =
+        typeof e.text === "string" && e.text.length
+          ? e.text
+          : start >= 0 && end > start
+          ? text.substring(start, end)
+          : "";
+
+      speechMarks.push({
+        time: ticksToMs(e.audioOffset), // ms from start
+        type: "word",
+        start,
+        end,
+        value,
+      });
+    };
+
+    synthesizer.speakTextAsync(
+      text,
+      (result) => {
+        synthesizer.close();
+
+        if (result.reason !== speechsdk.ResultReason.SynthesizingAudioCompleted) {
+          return res.status(500).json({
+            ok: false,
+            error: "Synthesis failed",
+            details: result.errorDetails || String(result.reason),
+          });
+        }
+
+        const audioBuffer = Buffer.from(result.audioData);
+
+        return res.json({
+          ok: true,
+          voice,
+          format,
+          audioBase64: audioBuffer.toString("base64"),
+          speechMarks,
+        });
+      },
+      (err) => {
+        synthesizer.close();
+        res.status(500).json({ ok: false, error: String(err) });
+      }
+    );
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
 // ===== START SERVER =====
