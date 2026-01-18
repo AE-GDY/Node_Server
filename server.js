@@ -945,6 +945,112 @@ function withRequestLock(fn) {
   });
 }
 
+function parseYMD(dateStr) {
+  const dt = DateTime.fromISO(String(dateStr), { zone: TZ });
+  if (!dt.isValid) return null;
+  return dt.toISODate(); // yyyy-MM-dd
+}
+
+// fetch a small daily window around the requested date, then pick exact match or nearest previous
+async function getCloseOnOrBeforeDate(clientRef, tickerRaw, ymd, { fallbackToPrevTradingDay = true } = {}) {
+  const sym = MARKET_SYM(tickerRaw);
+
+  // Use end of requested day (Cairo) as "to"
+  const targetEnd = DateTime.fromISO(ymd, { zone: TZ }).endOf("day");
+  const toUnix = Math.floor(targetEnd.toSeconds());
+
+  // Small range is usually enough (covers holidays/weekends)
+  const RANGE = 30;
+
+  const bars = await fetchBarsOnce(clientRef, sym, {
+    timeframe: "1D",
+    range: RANGE,
+    toUnix,
+    timeoutMs: TIMEOUT_DAILY_MS,
+    tag: `close@${ymd}`
+  });
+
+  if (!bars || !bars.length) return { date: ymd, close: null, resolvedDate: null };
+
+  // Map of yyyy-MM-dd -> close
+  const map = barsToDailyMapCairo(bars);
+
+  if (map.has(ymd)) {
+    return { date: ymd, close: map.get(ymd), resolvedDate: ymd };
+  }
+
+  if (!fallbackToPrevTradingDay) {
+    return { date: ymd, close: null, resolvedDate: null };
+  }
+
+  // Nearest previous date that exists in bars
+  const available = [...map.keys()].sort(); // ascending
+  let pick = null;
+  for (let i = available.length - 1; i >= 0; i--) {
+    if (available[i] < ymd) { pick = available[i]; break; }
+  }
+
+  return pick
+    ? { date: ymd, close: map.get(pick), resolvedDate: pick }
+    : { date: ymd, close: null, resolvedDate: null };
+}
+
+app.post("/close", async (req, res) => {
+  return withRequestLock(async () => {
+    const { ticker, date, fallback } = req.body || {};
+
+    if (!ticker || !date) {
+      return res.status(400).json({
+        error: "missing_params",
+        detail: 'Required JSON body: { "ticker": "COMI", "date": "2025-01-10" }'
+      });
+    }
+
+    const ymd = parseYMD(date);
+    if (!ymd) {
+      return res.status(400).json({
+        error: "bad_date",
+        detail: "date must be ISO format yyyy-mm-dd (e.g., 2025-01-10)"
+      });
+    }
+
+    // default: fallback enabled (resolve to nearest previous trading day)
+    const fallbackToPrevTradingDay =
+      String(fallback ?? "true").toLowerCase() !== "false";
+
+    const clientRef = { tv: createTvClient() };
+
+    try {
+      const out = await getCloseOnOrBeforeDate(
+        clientRef,
+        String(ticker),
+        ymd,
+        { fallbackToPrevTradingDay }
+      );
+
+      return res.json({
+        ticker: (String(ticker).includes(":")
+          ? String(ticker).split(":")[1]
+          : String(ticker)
+        ).toUpperCase(),
+        requestedDate: ymd,
+        resolvedDate: out.resolvedDate, // may be earlier if fallback happened
+        close: out.close                // null if not found
+      });
+
+    } catch (err) {
+      console.error("❌ /close failed:", err);
+      return res.status(500).json({
+        error: "internal_error",
+        detail: String(err?.message || err)
+      });
+
+    } finally {
+      destroyTvClient(clientRef.tv);
+    }
+  });
+});
+
 // ===== MAIN ROUTE =====
 app.post("/fetch", async (req, res) => {
 
