@@ -995,31 +995,116 @@ async function getCloseOnOrBeforeDate(clientRef, tickerRaw, ymd, { fallbackToPre
     : { date: ymd, close: null, resolvedDate: null };
 }
 
+function parseYMDMany(datesInput) {
+  const arr = Array.isArray(datesInput) ? datesInput : [datesInput];
+  const out = [];
+  for (const d of arr) {
+    const ymd = parseYMD(d);
+    if (!ymd) return null; // invalid
+    out.push(ymd);
+  }
+  // dedupe + sort
+  return [...new Set(out)].sort();
+}
+
+function daysBetweenInclusive(ymdMin, ymdMax) {
+  const a = DateTime.fromISO(ymdMin, { zone: TZ }).startOf("day");
+  const b = DateTime.fromISO(ymdMax, { zone: TZ }).startOf("day");
+  const diff = Math.round(b.diff(a, "days").days);
+  return Math.max(0, diff) + 1;
+}
+
+/**
+ * Fetch once per ticker for a date window, then resolve each requested date
+ * (exact match or nearest previous if fallback enabled).
+ */
+async function getClosesForDates(clientRef, tickerRaw, ymdList, { fallbackToPrevTradingDay = true } = {}) {
+  const sym = MARKET_SYM(tickerRaw);
+
+  const minYMD = ymdList[0];
+  const maxYMD = ymdList[ymdList.length - 1];
+
+  // Fetch up to end of max day (Cairo)
+  const maxEnd = DateTime.fromISO(maxYMD, { zone: TZ }).endOf("day");
+  const toUnix = Math.floor(maxEnd.toSeconds());
+
+  // Range to cover [min..max] + buffer for weekends/holidays + fallback lookback
+  const spanDays = daysBetweenInclusive(minYMD, maxYMD);
+  const RANGE = spanDays + 40; // buffer (tweak if you want)
+
+  const bars = await fetchBarsOnce(clientRef, sym, {
+    timeframe: "1D",
+    range: RANGE,
+    toUnix,
+    timeoutMs: TIMEOUT_DAILY_MS,
+    tag: `close@batch:${minYMD}->${maxYMD}`
+  });
+
+  if (!bars || !bars.length) {
+    // Return all nulls
+    const out = {};
+    for (const ymd of ymdList) out[ymd] = { close: null };
+    return out;
+  }
+
+  const map = barsToDailyMapCairo(bars); // yyyy-MM-dd -> close
+  const available = [...map.keys()].sort(); // ascending
+
+  const resolveOne = (ymd) => {
+    if (map.has(ymd)) return { close: map.get(ymd), resolvedDate: ymd };
+
+    if (!fallbackToPrevTradingDay) return { close: null, resolvedDate: null };
+
+    // nearest previous available date < ymd
+    for (let i = available.length - 1; i >= 0; i--) {
+      if (available[i] < ymd) {
+        const pick = available[i];
+        return { close: map.get(pick), resolvedDate: pick };
+      }
+    }
+    return { close: null, resolvedDate: null };
+  };
+
+  const out = {};
+  for (const ymd of ymdList) {
+    const r = resolveOne(ymd);
+    // EXACT format you requested: only close.
+    // If you also want resolvedDate, just include it below.
+    out[ymd] = { close: r.close };
+    // out[ymd] = { close: r.close, resolvedDate: r.resolvedDate }; // optional
+  }
+
+  return out;
+}
+
 app.post("/close", async (req, res) => {
   return withRequestLock(async () => {
-    const { ticker, tickers, date, fallback } = req.body || {};
+    const { ticker, tickers, date, dates, fallback } = req.body || {};
 
-    // Accept either:
-    //  - { ticker: "COMI", date: "2025-01-10" }
-    //  - { tickers: ["COMI","SWDY"], date: "2025-01-10" }
     const tickersIn =
       Array.isArray(tickers) && tickers.length
         ? tickers
         : (ticker ? [ticker] : []);
 
-    if (!tickersIn.length || !date) {
+    const datesIn =
+      (Array.isArray(dates) && dates.length)
+        ? dates
+        : (date ? [date] : []);
+
+    if (!tickersIn.length || !datesIn.length) {
       return res.status(400).json({
         error: "missing_params",
         detail:
-          'Required JSON body: { "tickers": ["COMI","SWDY"], "date": "2025-01-10" } (or use "ticker")'
+          'Required JSON body: { "tickers": ["COMI","SWDY"], "dates": ["2025-08-10","2025-08-11"] } ' +
+          '(or use "ticker"/"date")'
       });
     }
 
-    const ymd = parseYMD(date);
-    if (!ymd) {
+    const ymdList = parseYMDMany(datesIn);
+    if (!ymdList) {
       return res.status(400).json({
         error: "bad_date",
-        detail: "date must be ISO format yyyy-mm-dd (e.g., 2025-01-10)"
+        detail: 'All dates must be ISO yyyy-mm-dd (e.g., "2025-08-10")'
       });
     }
 
@@ -1029,50 +1114,35 @@ app.post("/close", async (req, res) => {
     const clientRef = { tv: createTvClient() };
 
     try {
-      // Optional: tune separately for /close if you want
       const CLOSE_CONCURRENCY = Number(process.env.CLOSE_CONCURRENCY || 6);
 
       const resultsArr = await mapPool(tickersIn, CLOSE_CONCURRENCY, async (t) => {
-        const out = await getCloseOnOrBeforeDate(
-          clientRef,
-          String(t),
-          ymd,
-          { fallbackToPrevTradingDay }
-        );
-
         const normalizedTicker = (String(t).includes(":")
           ? String(t).split(":")[1]
           : String(t)
         ).toUpperCase();
 
-        return {
-          ticker: normalizedTicker,
-          requestedDate: ymd,
-          resolvedDate: out.resolvedDate,
-          close: out.close
-        };
+        const perDate = await getClosesForDates(
+          clientRef,
+          String(t),
+          ymdList,
+          { fallbackToPrevTradingDay }
+        );
+
+        return { ticker: normalizedTicker, perDate };
       });
 
-      // Turn array -> map keyed by ticker
+      // Build nested map: results[ticker][ymd] = { close }
       const results = {};
       for (const r of resultsArr) {
         if (!r || !r.ticker) continue;
-        results[r.ticker] = {
-          requestedDate: r.requestedDate,
-          resolvedDate: r.resolvedDate,
-          close: r.close
-        };
+        results[r.ticker] = r.perDate || {};
       }
 
       return res.json({
-        requestedDate: ymd,
         fallback: fallbackToPrevTradingDay,
         results
       });
-
-      // If you prefer keyed-by-ticker instead of array, use this instead:
-      // const byTicker = Object.fromEntries(results.map(r => [r.ticker, r]));
-      // return res.json({ requestedDate: ymd, fallback: fallbackToPrevTradingDay, results: byTicker });
 
     } catch (err) {
       console.error("❌ /close failed:", err);
@@ -1080,6 +1150,7 @@ app.post("/close", async (req, res) => {
         error: "internal_error",
         detail: String(err?.message || err)
       });
+
     } finally {
       destroyTvClient(clientRef.tv);
     }
