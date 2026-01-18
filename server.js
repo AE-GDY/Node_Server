@@ -997,12 +997,21 @@ async function getCloseOnOrBeforeDate(clientRef, tickerRaw, ymd, { fallbackToPre
 
 app.post("/close", async (req, res) => {
   return withRequestLock(async () => {
-    const { ticker, date, fallback } = req.body || {};
+    const { ticker, tickers, date, fallback } = req.body || {};
 
-    if (!ticker || !date) {
+    // Accept either:
+    //  - { ticker: "COMI", date: "2025-01-10" }
+    //  - { tickers: ["COMI","SWDY"], date: "2025-01-10" }
+    const tickersIn =
+      Array.isArray(tickers) && tickers.length
+        ? tickers
+        : (ticker ? [ticker] : []);
+
+    if (!tickersIn.length || !date) {
       return res.status(400).json({
         error: "missing_params",
-        detail: 'Required JSON body: { "ticker": "COMI", "date": "2025-01-10" }'
+        detail:
+          'Required JSON body: { "tickers": ["COMI","SWDY"], "date": "2025-01-10" } (or use "ticker")'
       });
     }
 
@@ -1014,29 +1023,56 @@ app.post("/close", async (req, res) => {
       });
     }
 
-    // default: fallback enabled (resolve to nearest previous trading day)
     const fallbackToPrevTradingDay =
       String(fallback ?? "true").toLowerCase() !== "false";
 
     const clientRef = { tv: createTvClient() };
 
     try {
-      const out = await getCloseOnOrBeforeDate(
-        clientRef,
-        String(ticker),
-        ymd,
-        { fallbackToPrevTradingDay }
-      );
+      // Optional: tune separately for /close if you want
+      const CLOSE_CONCURRENCY = Number(process.env.CLOSE_CONCURRENCY || 6);
+
+      const resultsArr = await mapPool(tickersIn, CLOSE_CONCURRENCY, async (t) => {
+        const out = await getCloseOnOrBeforeDate(
+          clientRef,
+          String(t),
+          ymd,
+          { fallbackToPrevTradingDay }
+        );
+
+        const normalizedTicker = (String(t).includes(":")
+          ? String(t).split(":")[1]
+          : String(t)
+        ).toUpperCase();
+
+        return {
+          ticker: normalizedTicker,
+          requestedDate: ymd,
+          resolvedDate: out.resolvedDate,
+          close: out.close
+        };
+      });
+
+      // Turn array -> map keyed by ticker
+      const results = {};
+      for (const r of resultsArr) {
+        if (!r || !r.ticker) continue;
+        results[r.ticker] = {
+          requestedDate: r.requestedDate,
+          resolvedDate: r.resolvedDate,
+          close: r.close
+        };
+      }
 
       return res.json({
-        ticker: (String(ticker).includes(":")
-          ? String(ticker).split(":")[1]
-          : String(ticker)
-        ).toUpperCase(),
         requestedDate: ymd,
-        resolvedDate: out.resolvedDate, // may be earlier if fallback happened
-        close: out.close                // null if not found
+        fallback: fallbackToPrevTradingDay,
+        results
       });
+
+      // If you prefer keyed-by-ticker instead of array, use this instead:
+      // const byTicker = Object.fromEntries(results.map(r => [r.ticker, r]));
+      // return res.json({ requestedDate: ymd, fallback: fallbackToPrevTradingDay, results: byTicker });
 
     } catch (err) {
       console.error("❌ /close failed:", err);
@@ -1044,7 +1080,6 @@ app.post("/close", async (req, res) => {
         error: "internal_error",
         detail: String(err?.message || err)
       });
-
     } finally {
       destroyTvClient(clientRef.tv);
     }
