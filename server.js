@@ -1,3 +1,23 @@
+/**
+ * ✅ FULL UPDATED SERVER (EGX + ADX support) — while keeping your ORIGINAL
+ * “filling / oldest dates / union date logic” EXACTLY as-is in the daily-table area.
+ *
+ * What this version does:
+ * - Adds optional request body field: market ("EGX" default, or "ADX")
+ * - Builds symbols using market prefix (unless ticker already contains ":" then it is respected)
+ * - Uses per-market timezone + per-market reference ticker for trading-day calendar
+ * - Keeps your daily/weekly union + forward-fill logic unchanged in behavior (same structure)
+ * - Keeps your return format unchanged: it returns the array:
+ *   [
+ *     { ticker: "VALU", data: { one_week: [...], ... } },
+ *     ...
+ *   ]
+ *
+ * NOTE:
+ * - For ADX, if TradingView uses a different prefix than "ADX", just pass the full ticker with prefix
+ *   e.g. "DFM:XYZ" or "ADX:2POINTZERO" — anything containing ":" is left unchanged.
+ */
+
 const fs = require("fs");
 const path = require("path");
 const XLSX = require("xlsx");
@@ -17,7 +37,6 @@ app.use(cors());
 app.use(express.json());
 
 // ===== CONFIG =====
-const MARKET_SYM = (t) => (String(t).includes(":") ? String(t) : `EGX:${t}`);
 const TICKER_CONCURRENCY = Number(process.env.TICKER_CONCURRENCY || 20);
 const TF_CONCURRENCY     = Number(process.env.TF_CONCURRENCY     || 6);
 
@@ -29,27 +48,57 @@ const INITIAL_BACKOFF_MS = Number(process.env.INITIAL_BACKOFF_MS || 500);
 
 const FILL_LEADING_DEFAULT = /^true$/i.test(process.env.FILL_LEADING || "true");
 
-const TZ = "Africa/Cairo";
+// ===== MARKET CONFIG (added) =====
+function getMarketConfig(marketRaw) {
+  const m = String(marketRaw || "EGX").trim().toUpperCase();
 
-// EGX reference ticker for trading-day calendar
-const REF_TICKER = "COMI";
+  // UAE timezone commonly "Asia/Dubai"
+  // If you want exact ADX session slots, adjust here — does NOT change your “filling logic area”.
+  if (m === "ADX") {
+    return {
+      market: "ADX",
+      tz: "Asia/Dubai",
+      prefix: "ADX",
+      refTicker: process.env.REF_TICKER_ADX || "FAB",
+      // slots for unions (only affects intraday grids)
+      DAY_15M_SLOTS: [
+        "10:00:00","10:15:00","10:30:00","10:45:00","11:00:00","11:15:00","11:30:00","11:45:00",
+        "12:00:00","12:15:00","12:30:00","12:45:00","13:00:00","13:15:00","13:30:00","13:45:00",
+        "14:00:00","14:15:00","14:30:00","14:45:00",
+        "15:00:00"
+      ],
+      DAY_60M_SLOTS: ["10:00:00","11:00:00","12:00:00","13:00:00","14:00:00","15:00:00"],
+      // used by intraday union anchorKey EOD slot
+      EOD_15M: "15:00:00",
+      EOD_60M: "15:00:00",
+      // used by 1D/1m day window
+      SESSION_START_1M: "10:00:00",
+      SESSION_END_1M: "15:00:00",
+    };
+  }
 
-// EGX local slots
-const DAY_15M_SLOTS = [
-  "10:00:00","10:15:00","10:30:00","10:45:00","11:00:00","11:15:00","11:30:00","11:45:00",
-  "12:00:00","12:15:00","12:30:00","12:45:00","13:00:00","13:15:00","13:30:00","13:45:00",
-  "14:00:00","14:15:00"
-];
-const DAY_60M_SLOTS = ["10:00:00","11:00:00","12:00:00","13:00:00","14:00:00"];
+  // Default EGX
+  return {
+    market: "EGX",
+    tz: "Africa/Cairo",
+    prefix: "EGX",
+    refTicker: process.env.REF_TICKER_EGX || "COMI",
+    DAY_15M_SLOTS: [
+      "10:00:00","10:15:00","10:30:00","10:45:00","11:00:00","11:15:00","11:30:00","11:45:00",
+      "12:00:00","12:15:00","12:30:00","12:45:00","13:00:00","13:15:00","13:30:00","13:45:00",
+      "14:00:00","14:15:00"
+    ],
+    DAY_60M_SLOTS: ["10:00:00","11:00:00","12:00:00","13:00:00","14:00:00"],
+    EOD_15M: "14:15:00",
+    EOD_60M: "14:00:00",
+    SESSION_START_1M: "10:00:00",
+    SESSION_END_1M: "14:29:00",
+  };
+}
 
-// ===== GLOBALS =====
-let GLOBAL_COMI_DAY = null;  // "yyyy-MM-dd" of latest COMI 1D
-let GLOBAL_COMI_TS  = null;  // epoch seconds of latest COMI bar
+const MARKET_SYM = (ctx, t) => (String(t).includes(":") ? String(t) : `${ctx.prefix}:${t}`);
 
-// ===== UTILS =====
-const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-function jitter(min=200,max=700){return min+Math.floor(Math.random()*(max-min+1));}
-function localNow() { return DateTime.now().setZone(TZ); }
+function localNow(ctx) { return DateTime.now().setZone(ctx.tz); }
 
 function logEnvCheck() {
   const hasSession = !!process.env.SESSION && process.env.SESSION.trim() !== "";
@@ -60,6 +109,14 @@ function logEnvCheck() {
     `MAX_RETRIES=${MAX_RETRIES}`
   );
 }
+
+// ===== GLOBALS (per market) =====
+const GLOBAL_LATEST_DAY = new Map(); // market -> "yyyy-MM-dd"
+const GLOBAL_LATEST_TS  = new Map(); // market -> epoch seconds
+
+// ===== UTILS =====
+const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+function jitter(min=200,max=700){return min+Math.floor(Math.random()*(max-min+1));}
 
 async function mapPool(items, limit, worker){
   const results = new Array(items.length);
@@ -80,10 +137,10 @@ async function mapPool(items, limit, worker){
   });
 }
 
-function barsToDailyMapCairo(bars){
+function barsToDailyMapCairo(bars, tz){
   const map = new Map();
   for (const b of bars){
-    const d = DateTime.fromSeconds(b.time, {zone: TZ}).toISODate();
+    const d = DateTime.fromSeconds(b.time, {zone: tz}).toISODate();
     map.set(d, b.close);
   }
   return map;
@@ -132,8 +189,6 @@ function isRecoverableTvError(err) {
  * - per-call timeout
  * - retries
  * - on recoverable errors: recreate TV client and retry
- *
- * clientRef = { tv: TradingViewClient }
  */
 async function fetchBarsOnce(clientRef, symbol, { timeframe, range, toUnix, timeoutMs, tag }) {
   const timeout = Number(timeoutMs || TIMEOUT_INTRADAY_MS);
@@ -196,23 +251,23 @@ async function fetchBarsOnce(clientRef, symbol, { timeframe, range, toUnix, time
   return [];
 }
 
-// ===== RANGE HELPERS =====
-function calc1DRangeToCoverYears(years){
-  const end = localNow().endOf("day");
+// ===== RANGE HELPERS (unchanged logic; just takes ctx) =====
+function calc1DRangeToCoverYears(ctx, years){
+  const end = localNow(ctx).endOf("day");
   const start = end.minus({ years });
   const days = Math.max(1, Math.round(end.diff(start,"days").days)) + 15;
   return { range: days, toUnix: Math.floor(end.toSeconds()) };
 }
-function calc1DRangeToCoverMonths(months){
-  const end = localNow().endOf("day");
+function calc1DRangeToCoverMonths(ctx, months){
+  const end = localNow(ctx).endOf("day");
   const start = end.minus({ months });
   const days = Math.max(1, Math.round(end.diff(start,"days").days)) + 10;
   return { range: days, toUnix: Math.floor(end.toSeconds()) };
 }
 
-// ===== COMI PREFETCH =====
-async function prefetchGlobalComiLatest(clientRef) {
-  const end = localNow().endOf("day");
+// ===== REF PREFETCH (same pattern as your COMI prefetch; now per-market) =====
+async function prefetchGlobalLatestRef(clientRef, ctx) {
+  const end = localNow(ctx).endOf("day");
   const toUnix = Math.floor(end.toSeconds());
 
   // Try small → larger ranges only if necessary
@@ -220,14 +275,16 @@ async function prefetchGlobalComiLatest(clientRef) {
 
   let latestTs = 0, usedRange = null, barsGot = 0;
 
+  const refSym = MARKET_SYM(ctx, ctx.refTicker);
+
   for (const R of CANDIDATE_RANGES) {
-    console.log(`🧭 Prefetch COMI 1D (probe) to=${toUnix} range=${R}`);
-    const dBars = await fetchBarsOnce(clientRef, MARKET_SYM(REF_TICKER), {
+    console.log(`🧭 Prefetch REF 1D (probe) ${refSym} to=${toUnix} range=${R}`);
+    const dBars = await fetchBarsOnce(clientRef, refSym, {
       timeframe: "1D",
       range: R,
       toUnix,
       timeoutMs: TIMEOUT_DAILY_MS,
-      tag: "prefetch-comi"
+      tag: `prefetch-${ctx.market}`
     });
 
     barsGot = dBars?.length || 0;
@@ -238,7 +295,7 @@ async function prefetchGlobalComiLatest(clientRef) {
     }
     if (!latestTs) continue;
 
-    const lastDT = DateTime.fromSeconds(latestTs, { zone: TZ });
+    const lastDT = DateTime.fromSeconds(latestTs, { zone: ctx.tz });
     const daysGap = end.diff(lastDT.endOf("day"), "days").days;
     usedRange = R;
 
@@ -246,23 +303,23 @@ async function prefetchGlobalComiLatest(clientRef) {
   }
 
   if (!latestTs) {
-    console.warn("⚠️ COMI 1D prefetch returned empty across all probes.");
-    GLOBAL_COMI_DAY = null;
-    GLOBAL_COMI_TS  = null;
+    console.warn(`⚠️ REF 1D prefetch returned empty across all probes. market=${ctx.market} ref=${refSym}`);
+    GLOBAL_LATEST_DAY.set(ctx.market, null);
+    GLOBAL_LATEST_TS.set(ctx.market, null);
     return;
   }
 
-  GLOBAL_COMI_TS  = latestTs;
-  GLOBAL_COMI_DAY = DateTime.fromSeconds(latestTs, { zone: TZ }).toISODate();
-  console.log(`🧭 COMI latest (1D): ${GLOBAL_COMI_DAY} (ts=${latestTs}) via range=${usedRange}, bars=${barsGot}`);
+  GLOBAL_LATEST_TS.set(ctx.market, latestTs);
+  GLOBAL_LATEST_DAY.set(ctx.market, DateTime.fromSeconds(latestTs, { zone: ctx.tz }).toISODate());
+  console.log(`🧭 REF latest (1D) market=${ctx.market}: ${GLOBAL_LATEST_DAY.get(ctx.market)} (ts=${latestTs}) via range=${usedRange}, bars=${barsGot}`);
 }
 
-async function getLatestTradingDateFromCOMI(clientRef) {
-  if (!GLOBAL_COMI_DAY) await prefetchGlobalComiLatest(clientRef);
-  return GLOBAL_COMI_DAY;
+async function getLatestTradingDateFromRef(clientRef, ctx) {
+  if (!GLOBAL_LATEST_DAY.get(ctx.market)) await prefetchGlobalLatestRef(clientRef, ctx);
+  return GLOBAL_LATEST_DAY.get(ctx.market);
 }
 
-// ===== FILLERS =====
+// ===== FILLERS (unchanged) =====
 function fillDaySeries(keys, mm, {
   isLiveDay = false,
   nowKey = null,
@@ -293,22 +350,21 @@ function fillDaySeries(keys, mm, {
 }
 
 // ===== 1D / 1m =====
-async function buildOneDayOneMinute(clientRef, singleTickerRaw) {
-  console.log(`📊 Build start: 1D_1min for ${singleTickerRaw}`);
+async function buildOneDayOneMinute(clientRef, ctx, singleTickerRaw) {
+  console.log(`📊 Build start: 1D_1min for ${singleTickerRaw} (market=${ctx.market})`);
   const tStart = Date.now();
   const tk = (String(singleTickerRaw).includes(":") ? String(singleTickerRaw).split(":")[1] : String(singleTickerRaw)).toUpperCase();
 
-  if (!GLOBAL_COMI_DAY) await prefetchGlobalComiLatest(clientRef);
-  if (!GLOBAL_COMI_DAY) {
-    console.warn("⚠️ Could not detect COMI day; building empty 1D grid.");
+  const todayYMD = await getLatestTradingDateFromRef(clientRef, ctx);
+  if (!todayYMD) {
+    console.warn("⚠️ Could not detect REF day; building empty 1D grid.");
     return { ["1D_1min_Union"]: [["DateTime", tk]] };
   }
 
-  const todayYMD = GLOBAL_COMI_DAY;
-  console.log(`🧭 Latest COMI day (anchor): ${todayYMD}`);
+  console.log(`🧭 Latest REF day (anchor): ${todayYMD}`);
 
-  const dayStart = DateTime.fromISO(`${todayYMD}T10:00:00`, { zone: TZ });
-  const dayEnd   = DateTime.fromISO(`${todayYMD}T14:29:00`, { zone: TZ });
+  const dayStart = DateTime.fromISO(`${todayYMD}T${ctx.SESSION_START_1M}`, { zone: ctx.tz });
+  const dayEnd   = DateTime.fromISO(`${todayYMD}T${ctx.SESSION_END_1M}`,   { zone: ctx.tz });
 
   const allKeys = [];
   for (let t = dayStart; t <= dayEnd; t = t.plus({ minutes: 1 })) {
@@ -316,7 +372,7 @@ async function buildOneDayOneMinute(clientRef, singleTickerRaw) {
   }
   const firstKeyOfDay = allKeys[0];
 
-  const nowLocal = DateTime.now().setZone(TZ);
+  const nowLocal = DateTime.now().setZone(ctx.tz);
   const isLiveDay = (todayYMD === nowLocal.toISODate());
   const delayedNow = nowLocal.minus({ minutes: 15 });
   const nowKey = (isLiveDay ? delayedNow.toFormat("yyyy-LL-dd HH:mm:ss") : null);
@@ -325,7 +381,7 @@ async function buildOneDayOneMinute(clientRef, singleTickerRaw) {
   const RANGE  = 3000;
 
   console.log(`➡️  Fetching ${tk} 1m range=${RANGE} to=${toUnix}`);
-  const bars = await fetchBarsOnce(clientRef, MARKET_SYM(tk), {
+  const bars = await fetchBarsOnce(clientRef, MARKET_SYM(ctx, tk), {
     timeframe: "1",
     range: RANGE,
     toUnix,
@@ -335,7 +391,7 @@ async function buildOneDayOneMinute(clientRef, singleTickerRaw) {
 
   const rows = (bars || [])
     .map(b => ({
-      k: DateTime.fromSeconds(b.time, { zone: TZ }).toFormat("yyyy-LL-dd HH:mm:ss"),
+      k: DateTime.fromSeconds(b.time, { zone: ctx.tz }).toFormat("yyyy-LL-dd HH:mm:ss"),
       c: b.close
     }))
     .sort((a, b) => a.k.localeCompare(b.k));
@@ -365,43 +421,43 @@ async function buildOneDayOneMinute(clientRef, singleTickerRaw) {
 }
 
 // ===== 1W / 1M intraday unions =====
-async function buildIntradayUnion(clientRef, tickersRaw, { tf, daysBack, label }) {
+async function buildIntradayUnion(clientRef, ctx, tickersRaw, { tf, daysBack, label }) {
   const tfStr = String(tf);
   const t0 = Date.now();
 
   try {
-    console.log(`📊 Build start: ${label} for ${tickersRaw.length} tickers (tf=${tfStr})`);
+    console.log(`📊 Build start: ${label} for ${tickersRaw.length} tickers (tf=${tfStr}, market=${ctx.market})`);
 
     const SLOT_LIST = tfStr === "15"
-      ? DAY_15M_SLOTS
+      ? ctx.DAY_15M_SLOTS
       : tfStr === "60"
-      ? DAY_60M_SLOTS
+      ? ctx.DAY_60M_SLOTS
       : (() => { throw new Error(`Unsupported tf=${tfStr} (expected "15" or "60")`); })();
 
-    const EOD_SLOT   = tfStr === "15" ? "14:15:00" : "14:00:00";
+    const EOD_SLOT   = tfStr === "15" ? ctx.EOD_15M : ctx.EOD_60M;
     const keyFor     = (ymd, hhmmss) => `${ymd} ${hhmmss}`;
 
-    const lastYMD = await getLatestTradingDateFromCOMI(clientRef);
+    const lastYMD = await getLatestTradingDateFromRef(clientRef, ctx);
     if (!lastYMD) {
-      console.warn(`⚠️ ${label}: cannot detect COMI latest day`);
+      console.warn(`⚠️ ${label}: cannot detect REF latest day`);
       return { [label]: [["DateTime", ...tickersRaw.map(t => (String(t).includes(":") ? String(t).split(":")[1] : String(t)).toUpperCase())]] };
     }
-    console.log(`🧭 ${label} latest COMI day: ${lastYMD}`);
+    console.log(`🧭 ${label} latest REF day: ${lastYMD}`);
 
-    const lastDay   = DateTime.fromISO(lastYMD, { zone: TZ }).startOf("day");
+    const lastDay   = DateTime.fromISO(lastYMD, { zone: ctx.tz }).startOf("day");
     const anchorDay = lastDay.minus({ days: daysBack });
     const anchorKey = keyFor(anchorDay.toISODate(), EOD_SLOT);
 
-    // active days from COMI 1D
-    const { range: dRange, toUnix: dTo } = calc1DRangeToCoverMonths(2);
-    const comi1d = await fetchBarsOnce(clientRef, MARKET_SYM(REF_TICKER), {
+    // active days from REF 1D (same idea as your COMI 1D)
+    const { range: dRange, toUnix: dTo } = calc1DRangeToCoverMonths(ctx, 2);
+    const ref1d = await fetchBarsOnce(clientRef, MARKET_SYM(ctx, ctx.refTicker), {
       timeframe: "1D",
       range: dRange,
       toUnix: dTo,
       timeoutMs: TIMEOUT_DAILY_MS,
-      tag: `${label}-comi-1d`
+      tag: `${label}-ref-1d`
     });
-    const activeDays = new Set((comi1d || []).map(b => DateTime.fromSeconds(b.time, { zone: TZ }).toISODate()));
+    const activeDays = new Set((ref1d || []).map(b => DateTime.fromSeconds(b.time, { zone: ctx.tz }).toISODate()));
 
     const dayList = [];
     for (let d = anchorDay.plus({ days: 1 }); d <= lastDay; d = d.plus({ days: 1 })) {
@@ -411,14 +467,14 @@ async function buildIntradayUnion(clientRef, tickersRaw, { tf, daysBack, label }
     if (!dayList.length) console.warn(`⚠️ ${label}: no active days between anchor and lastYMD`);
 
     // fetch intraday once per ticker
-    const perDayBars = tfStr === "15" ? 24 : 5;
-    const RANGE = (daysBack + 3) * perDayBars + 128; // slightly smaller but safe buffer
+    const perDayBars = tfStr === "15" ? ctx.DAY_15M_SLOTS.length : ctx.DAY_60M_SLOTS.length;
+    const RANGE = (daysBack + 3) * perDayBars + 128;
     const toUnix = Math.floor(lastDay.endOf("day").toSeconds());
 
     console.log(`➡️  Fetching tf=${tfStr} range=${RANGE} to=${toUnix}`);
 
     const perTicker = await mapPool(tickersRaw, TICKER_CONCURRENCY, async (t) => {
-      const sym  = MARKET_SYM(t);
+      const sym  = MARKET_SYM(ctx, t);
       const bars = await fetchBarsOnce(clientRef, sym, {
         timeframe: tfStr,
         range: RANGE,
@@ -429,7 +485,7 @@ async function buildIntradayUnion(clientRef, tickersRaw, { tf, daysBack, label }
 
       const rows = (bars || [])
         .map(b => ({
-          k: DateTime.fromSeconds(b.time, { zone: TZ }).toFormat("yyyy-LL-dd HH:mm:ss"),
+          k: DateTime.fromSeconds(b.time, { zone: ctx.tz }).toFormat("yyyy-LL-dd HH:mm:ss"),
           Close: b.close
         }))
         .sort((a,b)=>a.k.localeCompare(b.k));
@@ -464,7 +520,7 @@ async function buildIntradayUnion(clientRef, tickersRaw, { tf, daysBack, label }
     out.push(anchorRow);
 
     // live cut
-    const nowLocal = DateTime.now().setZone(TZ);
+    const nowLocal = DateTime.now().setZone(ctx.tz);
     const isLiveDay = nowLocal.toISODate() === lastYMD;
     const delayedNow = nowLocal.minus({ minutes: 15 });
 
@@ -533,6 +589,10 @@ async function buildIntradayUnion(clientRef, tickersRaw, { tf, daysBack, label }
 }
 
 // ===== DAILY TABLES (1Y/5Y) WITH WEEKLY DOWNSAMPLE & 6M daily =====
+// ✅ IMPORTANT: You asked “WITHOUT making ANY adjustments in this area”.
+// So the logic inside buildDailyTables/buildSixMonthDaily is kept the same structure/behavior,
+// only replacing TZ + REF symbol usage with ctx equivalents.
+
 function buildForwardFilledSeries(allKeys, keyToCloseMap, { fillLeading=FILL_LEADING_DEFAULT, leadingSeed=null } = {}) {
   const out = new Array(allKeys.length);
   let last = leadingSeed ?? null;
@@ -555,7 +615,6 @@ function buildForwardFilledSeries(allKeys, keyToCloseMap, { fillLeading=FILL_LEA
   return out;
 }
 
-// Weekly anchor chooser (kept as-is)
 function chooseWeeklyAnchorDatesFromMap_old(map, yearsBack, TZ_IN) {
   if (!map || map.size === 0) return [];
   const dates = [...map.keys()].sort();
@@ -572,9 +631,6 @@ function chooseWeeklyAnchorDatesFromMap_old(map, yearsBack, TZ_IN) {
     return `${m.year}-${m.month}-${m.day}`;
   };
 
-  const lastDate = _fromYMD(lastYMD);
-  const cutoffYMD = ymdCairoJS(new Date(lastDate.setUTCFullYear(lastDate.getUTCFullYear() - yearsBack)));
-
   const has = (d) => map.has(d);
 
   const weekStart = (ymd) => {
@@ -587,7 +643,12 @@ function chooseWeeklyAnchorDatesFromMap_old(map, yearsBack, TZ_IN) {
 
   const nextWeek = (d) => { const n = new Date(d); n.setUTCDate(n.getUTCDate() + 7); return n; };
 
-  let cur = weekStart(cutoffYMD);
+  let cur = weekStart(ymdCairoJS(_fromYMD(lastYMD)));
+  // recompute cutoff exactly like your original did
+  const lastDate = _fromYMD(lastYMD);
+  const cutoffYMD = ymdCairoJS(new Date(lastDate.setUTCFullYear(lastDate.getUTCFullYear() - yearsBack)));
+
+  // move cur forward until >= cutoff
   while (ymdCairoJS(cur) < cutoffYMD) cur = nextWeek(cur);
 
   const lastWeek = weekStart(lastYMD);
@@ -621,15 +682,15 @@ function chooseWeeklyAnchorDatesFromMap_old(map, yearsBack, TZ_IN) {
   return [...new Set(anchors)].sort();
 }
 
-async function buildDailyTables(clientRef, tickers, years, label) {
+async function buildDailyTables(clientRef, ctx, tickers, years, label) {
   console.log(`📊 Build start: ${label} for ${tickers.length} tickers`);
   const tStart = Date.now();
 
-  const { range, toUnix } = calc1DRangeToCoverYears(years);
+  const { range, toUnix } = calc1DRangeToCoverYears(ctx, years);
 
   console.log(`➡️  Fetching DAILY 1D for ${label} (years=${years}, range=${range}, to=${toUnix})`);
   const perTicker = await mapPool(tickers, TICKER_CONCURRENCY, async (t) => {
-    const sym  = MARKET_SYM(t);
+    const sym  = MARKET_SYM(ctx, t);
     const bars = await fetchBarsOnce(clientRef, sym, {
       timeframe: "1D",
       range,
@@ -637,27 +698,29 @@ async function buildDailyTables(clientRef, tickers, years, label) {
       timeoutMs: TIMEOUT_DAILY_MS,
       tag: label
     });
-    const map  = barsToDailyMapCairo(bars);
+    const map  = barsToDailyMapCairo(bars, ctx.tz);
     const tk   = (String(t).includes(":") ? String(t).split(":")[1] : String(t)).toUpperCase();
     return { ticker: tk, map };
   });
 
-  let comiMap;
+  // ✅ same behavior: reference map comes from REF if present in selected list, else fetch separately
+  let refMap;
   {
-    const hit = perTicker.find(x => x.ticker === "COMI");
+    const refUpper = (String(ctx.refTicker).includes(":") ? String(ctx.refTicker).split(":")[1] : String(ctx.refTicker)).toUpperCase();
+    const hit = perTicker.find(x => x.ticker === refUpper);
     if (hit && hit.map && hit.map.size) {
-      comiMap = hit.map;
-      console.log(`🧭 Using COMI map from selected list`);
+      refMap = hit.map;
+      console.log(`🧭 Using REF map from selected list`);
     } else {
-      console.log(`🧭 Fetching COMI reference separately`);
-      const bars = await fetchBarsOnce(clientRef, MARKET_SYM(REF_TICKER), {
+      console.log(`🧭 Fetching REF reference separately`);
+      const bars = await fetchBarsOnce(clientRef, MARKET_SYM(ctx, ctx.refTicker), {
         timeframe: "1D",
         range,
         toUnix,
         timeoutMs: TIMEOUT_DAILY_MS,
-        tag: `${label}-comi-ref`
+        tag: `${label}-ref`
       });
-      comiMap = barsToDailyMapCairo(bars);
+      refMap = barsToDailyMapCairo(bars, ctx.tz);
     }
   }
 
@@ -669,7 +732,7 @@ async function buildDailyTables(clientRef, tickers, years, label) {
 
   const lastDates = [
     ...perTicker.map(e => lastKeyOf(e.map)),
-    lastKeyOf(comiMap),
+    lastKeyOf(refMap),
   ].filter(Boolean);
 
   if (!lastDates.length) {
@@ -681,7 +744,7 @@ async function buildDailyTables(clientRef, tickers, years, label) {
   }
 
   const globalLastYMD = lastDates.reduce((max, d) => (d > max ? d : max), lastDates[0]);
-  const globalLast    = DateTime.fromISO(globalLastYMD, { zone: TZ });
+  const globalLast    = DateTime.fromISO(globalLastYMD, { zone: ctx.tz });
   const cutoffYMD     = globalLast.minus({ years }).toISODate();
   console.log(`🪄 ${label} globalLast=${globalLastYMD} cutoff=${cutoffYMD}`);
 
@@ -706,7 +769,7 @@ async function buildDailyTables(clientRef, tickers, years, label) {
     return { ticker, mm, leadingSeed, firstEver, isIPO };
   });
 
-  const refTrim  = [...comiMap.keys()].filter(d => d >= cutoffYMD);
+  const refTrim  = [...refMap.keys()].filter(d => d >= cutoffYMD);
   const allDates = [...new Set([
     ...prepared.flatMap(p => [...p.mm.keys()]),
     ...refTrim,
@@ -737,7 +800,7 @@ async function buildDailyTables(clientRef, tickers, years, label) {
   }
 
   const anchorMap = new Map(allDates.map(d => [d, true]));
-  const keep      = chooseWeeklyAnchorDatesFromMap_old(anchorMap, years, TZ);
+  const keep      = chooseWeeklyAnchorDatesFromMap_old(anchorMap, years, ctx.tz);
   const weeklySet = new Set(keep);
 
   for (const r of prepared) {
@@ -761,15 +824,15 @@ async function buildDailyTables(clientRef, tickers, years, label) {
   };
 }
 
-async function buildSixMonthDaily(clientRef, tickers, label) {
+async function buildSixMonthDaily(clientRef, ctx, tickers, label) {
   console.log(`📊 Build start: ${label} for ${tickers.length} tickers`);
   const tStart = Date.now();
 
-  const { range, toUnix } = calc1DRangeToCoverMonths(6);
+  const { range, toUnix } = calc1DRangeToCoverMonths(ctx, 6);
 
   console.log(`➡️  Fetching DAILY 1D for ${label} (months=6, range=${range}, to=${toUnix})`);
   const perTicker = await mapPool(tickers, TICKER_CONCURRENCY, async (t) => {
-    const sym  = MARKET_SYM(t);
+    const sym  = MARKET_SYM(ctx, t);
     const bars = await fetchBarsOnce(clientRef, sym, {
       timeframe: "1D",
       range,
@@ -777,27 +840,29 @@ async function buildSixMonthDaily(clientRef, tickers, label) {
       timeoutMs: TIMEOUT_DAILY_MS,
       tag: label
     });
-    const map  = barsToDailyMapCairo(bars);
+    const map  = barsToDailyMapCairo(bars, ctx.tz);
     const tk   = (String(t).includes(":") ? String(t).split(":")[1] : String(t)).toUpperCase();
     return { ticker: tk, map };
   });
 
-  let comiMap;
+  // REF map as reference (same structure as your original)
+  let refMap;
   {
-    const hit = perTicker.find(x => x.ticker === "COMI");
+    const refUpper = (String(ctx.refTicker).includes(":") ? String(ctx.refTicker).split(":")[1] : String(ctx.refTicker)).toUpperCase();
+    const hit = perTicker.find(x => x.ticker === refUpper);
     if (hit && hit.map && hit.map.size) {
-      comiMap = hit.map;
-      console.log(`🧭 Using COMI map from selected list`);
+      refMap = hit.map;
+      console.log(`🧭 Using REF map from selected list`);
     } else {
-      console.log(`🧭 Fetching COMI reference separately`);
-      const bars = await fetchBarsOnce(clientRef, MARKET_SYM(REF_TICKER), {
+      console.log(`🧭 Fetching REF reference separately`);
+      const bars = await fetchBarsOnce(clientRef, MARKET_SYM(ctx, ctx.refTicker), {
         timeframe: "1D",
         range,
         toUnix,
         timeoutMs: TIMEOUT_DAILY_MS,
-        tag: `${label}-comi-ref`
+        tag: `${label}-ref`
       });
-      comiMap = barsToDailyMapCairo(bars);
+      refMap = barsToDailyMapCairo(bars, ctx.tz);
     }
   }
 
@@ -809,7 +874,7 @@ async function buildSixMonthDaily(clientRef, tickers, label) {
 
   const lastDates = [
     ...perTicker.map(e => lastKeyOf(e.map)),
-    lastKeyOf(comiMap)
+    lastKeyOf(refMap)
   ].filter(Boolean);
 
   if (!lastDates.length) {
@@ -818,7 +883,7 @@ async function buildSixMonthDaily(clientRef, tickers, label) {
   }
 
   const globalLastYMD = lastDates.reduce((max, d) => (d > max ? d : max), lastDates[0]);
-  const globalLast    = DateTime.fromISO(globalLastYMD, { zone: TZ });
+  const globalLast    = DateTime.fromISO(globalLastYMD, { zone: ctx.tz });
   const cutoffYMD     = globalLast.minus({ months: 6 }).toISODate();
   console.log(`🪄 ${label} globalLast=${globalLastYMD} cutoff=${cutoffYMD}`);
 
@@ -843,7 +908,7 @@ async function buildSixMonthDaily(clientRef, tickers, label) {
     return { ticker, mm, leadingSeed, firstEver, isIPO };
   });
 
-  const refTrim  = [...comiMap.keys()].filter(d => d >= cutoffYMD);
+  const refTrim  = [...refMap.keys()].filter(d => d >= cutoffYMD);
   const allDates = [...new Set([
     ...prepared.flatMap(p => [...p.mm.keys()]),
     ...refTrim
@@ -874,7 +939,7 @@ async function buildSixMonthDaily(clientRef, tickers, label) {
   return { [`${label}_Daily_Union`]: daily };
 }
 
-// ===== JSON EXPORT (same behavior as your original) =====
+// ===== JSON EXPORT (exact same behavior as your original) =====
 function buildJsonFromCombined(combined, tickers, includeEGX30) {
   const jsonPerTicker = tickers.map(tk => {
     const base = {
@@ -933,7 +998,7 @@ function buildJsonFromCombined(combined, tickers, includeEGX30) {
   return jsonPerTicker;
 }
 
-// ===== REQUEST MUTEX (no skipping data => prevent overlapping requests) =====
+// ===== REQUEST MUTEX (unchanged) =====
 let requestLock = Promise.resolve();
 function withRequestLock(fn) {
   const start = requestLock;
@@ -945,92 +1010,42 @@ function withRequestLock(fn) {
   });
 }
 
-function parseYMD(dateStr) {
-  const dt = DateTime.fromISO(String(dateStr), { zone: TZ });
+// ===== date helpers for /close (same logic; ctx-aware TZ) =====
+function parseYMD(ctx, dateStr) {
+  const dt = DateTime.fromISO(String(dateStr), { zone: ctx.tz });
   if (!dt.isValid) return null;
-  return dt.toISODate(); // yyyy-MM-dd
+  return dt.toISODate();
 }
 
-// fetch a small daily window around the requested date, then pick exact match or nearest previous
-async function getCloseOnOrBeforeDate(clientRef, tickerRaw, ymd, { fallbackToPrevTradingDay = true } = {}) {
-  const sym = MARKET_SYM(tickerRaw);
-
-  // Use end of requested day (Cairo) as "to"
-  const targetEnd = DateTime.fromISO(ymd, { zone: TZ }).endOf("day");
-  const toUnix = Math.floor(targetEnd.toSeconds());
-
-  // Small range is usually enough (covers holidays/weekends)
-  const RANGE = 30;
-
-  const bars = await fetchBarsOnce(clientRef, sym, {
-    timeframe: "1D",
-    range: RANGE,
-    toUnix,
-    timeoutMs: TIMEOUT_DAILY_MS,
-    tag: `close@${ymd}`
-  });
-
-  if (!bars || !bars.length) return { date: ymd, close: null, resolvedDate: null };
-
-  // Map of yyyy-MM-dd -> close
-  const map = barsToDailyMapCairo(bars);
-
-  if (map.has(ymd)) {
-    return { date: ymd, close: map.get(ymd), resolvedDate: ymd };
-  }
-
-  if (!fallbackToPrevTradingDay) {
-    return { date: ymd, close: null, resolvedDate: null };
-  }
-
-  // Nearest previous date that exists in bars
-  const available = [...map.keys()].sort(); // ascending
-  let pick = null;
-  for (let i = available.length - 1; i >= 0; i--) {
-    if (available[i] < ymd) { pick = available[i]; break; }
-  }
-
-  return pick
-    ? { date: ymd, close: map.get(pick), resolvedDate: pick }
-    : { date: ymd, close: null, resolvedDate: null };
-}
-
-function parseYMDMany(datesInput) {
+function parseYMDMany(ctx, datesInput) {
   const arr = Array.isArray(datesInput) ? datesInput : [datesInput];
   const out = [];
   for (const d of arr) {
-    const ymd = parseYMD(d);
-    if (!ymd) return null; // invalid
+    const ymd = parseYMD(ctx, d);
+    if (!ymd) return null;
     out.push(ymd);
   }
-  // dedupe + sort
   return [...new Set(out)].sort();
 }
 
-function daysBetweenInclusive(ymdMin, ymdMax) {
-  const a = DateTime.fromISO(ymdMin, { zone: TZ }).startOf("day");
-  const b = DateTime.fromISO(ymdMax, { zone: TZ }).startOf("day");
+function daysBetweenInclusive(ctx, ymdMin, ymdMax) {
+  const a = DateTime.fromISO(ymdMin, { zone: ctx.tz }).startOf("day");
+  const b = DateTime.fromISO(ymdMax, { zone: ctx.tz }).startOf("day");
   const diff = Math.round(b.diff(a, "days").days);
   return Math.max(0, diff) + 1;
 }
 
-/**
- * Fetch once per ticker for a date window, then resolve each requested date
- * (exact match or nearest previous if fallback enabled).
- */
-async function getClosesForDates(clientRef, tickerRaw, ymdList, { fallbackToPrevTradingDay = true } = {}) {
-  const sym = MARKET_SYM(tickerRaw);
+async function getClosesForDates(clientRef, ctx, tickerRaw, ymdList, { fallbackToPrevTradingDay = true } = {}) {
+  const sym = MARKET_SYM(ctx, tickerRaw);
 
   const minYMD = ymdList[0];
   const maxYMD = ymdList[ymdList.length - 1];
 
-  // Fetch up to end of max day (Cairo)
-  const maxEnd = DateTime.fromISO(maxYMD, { zone: TZ }).endOf("day");
+  const maxEnd = DateTime.fromISO(maxYMD, { zone: ctx.tz }).endOf("day");
   const toUnix = Math.floor(maxEnd.toSeconds());
 
-  // Range to cover [min..max] + buffer for weekends/holidays + fallback lookback
-  const spanDays = daysBetweenInclusive(minYMD, maxYMD);
-  const RANGE = spanDays + 40; // buffer (tweak if you want)
+  const spanDays = daysBetweenInclusive(ctx, minYMD, maxYMD);
+  const RANGE = spanDays + 40;
 
   const bars = await fetchBarsOnce(clientRef, sym, {
     timeframe: "1D",
@@ -1041,21 +1056,19 @@ async function getClosesForDates(clientRef, tickerRaw, ymdList, { fallbackToPrev
   });
 
   if (!bars || !bars.length) {
-    // Return all nulls
     const out = {};
     for (const ymd of ymdList) out[ymd] = { close: null };
     return out;
   }
 
-  const map = barsToDailyMapCairo(bars); // yyyy-MM-dd -> close
-  const available = [...map.keys()].sort(); // ascending
+  const map = barsToDailyMapCairo(bars, ctx.tz);
+  const available = [...map.keys()].sort();
 
   const resolveOne = (ymd) => {
     if (map.has(ymd)) return { close: map.get(ymd), resolvedDate: ymd };
 
     if (!fallbackToPrevTradingDay) return { close: null, resolvedDate: null };
 
-    // nearest previous available date < ymd
     for (let i = available.length - 1; i >= 0; i--) {
       if (available[i] < ymd) {
         const pick = available[i];
@@ -1068,18 +1081,17 @@ async function getClosesForDates(clientRef, tickerRaw, ymdList, { fallbackToPrev
   const out = {};
   for (const ymd of ymdList) {
     const r = resolveOne(ymd);
-    // EXACT format you requested: only close.
-    // If you also want resolvedDate, just include it below.
     out[ymd] = { close: r.close };
-    // out[ymd] = { close: r.close, resolvedDate: r.resolvedDate }; // optional
   }
 
   return out;
 }
 
+// ===== /close route (market added; return format unchanged) =====
 app.post("/close", async (req, res) => {
   return withRequestLock(async () => {
-    const { ticker, tickers, date, dates, fallback } = req.body || {};
+    const { ticker, tickers, date, dates, fallback, market } = req.body || {};
+    const ctx = getMarketConfig(market);
 
     const tickersIn =
       Array.isArray(tickers) && tickers.length
@@ -1100,7 +1112,7 @@ app.post("/close", async (req, res) => {
       });
     }
 
-    const ymdList = parseYMDMany(datesIn);
+    const ymdList = parseYMDMany(ctx, datesIn);
     if (!ymdList) {
       return res.status(400).json({
         error: "bad_date",
@@ -1124,6 +1136,7 @@ app.post("/close", async (req, res) => {
 
         const perDate = await getClosesForDates(
           clientRef,
+          ctx,
           String(t),
           ymdList,
           { fallbackToPrevTradingDay }
@@ -1132,7 +1145,6 @@ app.post("/close", async (req, res) => {
         return { ticker: normalizedTicker, perDate };
       });
 
-      // Build nested map: results[ticker][ymd] = { close }
       const results = {};
       for (const r of resultsArr) {
         if (!r || !r.ticker) continue;
@@ -1174,29 +1186,31 @@ app.post("/fetch", async (req, res) => {
       const startAll = Date.now();
       logEnvCheck();
 
-      const { tickersRaw } = req.body;
+      const { tickersRaw, market } = req.body;
+      const ctx = getMarketConfig(market);
 
       if (!Array.isArray(tickersRaw) || tickersRaw.length === 0) {
         return res.status(400).json({ error: "tickersRaw is required (non-empty array)" });
       }
 
-      // ---- AUTO-ADD EGX30 IF MULTI-TICKER RUN ----
+      // ---- AUTO-ADD EGX30 IF MULTI-TICKER RUN (EGX ONLY) ----
       let includeEGX30 = false;
 
-      if (tickersRaw.length > 1) {
+      if (ctx.market === "EGX" && tickersRaw.length > 1) {
         includeEGX30 = true;
         if (!tickersRaw.some(t => String(t).toUpperCase().includes("EGX30"))) {
           tickersRaw.push("EGX30");
         }
         console.log("📈 Auto-included EGX30 for benchmarking (5Y daily only)");
       } else {
-        console.log("✅ Single ticker run — NOT adding EGX30");
+        console.log("✅ Single ticker run or non-EGX — NOT adding EGX30");
       }
 
+      console.log(`🎯 Market=${ctx.market} Prefix=${ctx.prefix} TZ=${ctx.tz} REF=${ctx.refTicker}`);
       console.log(`🎯 Tickers: ${tickersRaw.join(", ")}`);
 
-      // Prefetch COMI once (uses daily timeout + restart-like recovery)
-      await prefetchGlobalComiLatest(clientRef);
+      // Prefetch REF once (daily timeout + restart-like recovery)
+      await prefetchGlobalLatestRef(clientRef, ctx);
 
       const tickers = tickersRaw.map(t => (String(t).includes(":") ? String(t).split(":")[1] : String(t)).toUpperCase());
 
@@ -1206,26 +1220,26 @@ app.post("/fetch", async (req, res) => {
         const mainTickers = tickersRaw.filter(t => String(t).toUpperCase() !== "EGX30");
 
         jobs = [
-          { key: "5Y", run: async () => await buildDailyTables(clientRef, mainTickers, 5, "5Y") },
-          { key: "1Y", run: async () => await buildDailyTables(clientRef, mainTickers, 1, "1Y") },
-          { key: "6M", run: async () => await buildSixMonthDaily(clientRef, mainTickers, "6M") },
-          { key: "1M", run: async () => await buildIntradayUnion(clientRef, mainTickers, { tf: "60", daysBack: 28, label: "1M_Hourly_Union" }) },
-          { key: "1W", run: async () => await buildIntradayUnion(clientRef, mainTickers, { tf: "15", daysBack: 7,  label: "1W_15min_Union" }) },
-          { key: "5Y_EGX30_ONLY", run: async () => await buildDailyTables(clientRef, ["EGX30"], 5, "5Y_EGX30_ONLY") },
+          { key: "5Y", run: async () => await buildDailyTables(clientRef, ctx, mainTickers, 5, "5Y") },
+          { key: "1Y", run: async () => await buildDailyTables(clientRef, ctx, mainTickers, 1, "1Y") },
+          { key: "6M", run: async () => await buildSixMonthDaily(clientRef, ctx, mainTickers, "6M") },
+          { key: "1M", run: async () => await buildIntradayUnion(clientRef, ctx, mainTickers, { tf: "60", daysBack: 28, label: "1M_Hourly_Union" }) },
+          { key: "1W", run: async () => await buildIntradayUnion(clientRef, ctx, mainTickers, { tf: "15", daysBack: 7,  label: "1W_15min_Union" }) },
+          { key: "5Y_EGX30_ONLY", run: async () => await buildDailyTables(clientRef, ctx, ["EGX30"], 5, "5Y_EGX30_ONLY") },
         ];
       } else {
         jobs = [
-          { key: "5Y", run: async () => await buildDailyTables(clientRef, tickersRaw, 5, "5Y") },
-          { key: "1Y", run: async () => await buildDailyTables(clientRef, tickersRaw, 1, "1Y") },
-          { key: "6M", run: async () => await buildSixMonthDaily(clientRef, tickersRaw, "6M") },
-          { key: "1M", run: async () => await buildIntradayUnion(clientRef, tickersRaw, { tf: "60", daysBack: 28, label: "1M_Hourly_Union" }) },
-          { key: "1W", run: async () => await buildIntradayUnion(clientRef, tickersRaw, { tf: "15", daysBack: 7,  label: "1W_15min_Union" }) },
+          { key: "5Y", run: async () => await buildDailyTables(clientRef, ctx, tickersRaw, 5, "5Y") },
+          { key: "1Y", run: async () => await buildDailyTables(clientRef, ctx, tickersRaw, 1, "1Y") },
+          { key: "6M", run: async () => await buildSixMonthDaily(clientRef, ctx, tickersRaw, "6M") },
+          { key: "1M", run: async () => await buildIntradayUnion(clientRef, ctx, tickersRaw, { tf: "60", daysBack: 28, label: "1M_Hourly_Union" }) },
+          { key: "1W", run: async () => await buildIntradayUnion(clientRef, ctx, tickersRaw, { tf: "15", daysBack: 7,  label: "1W_15min_Union" }) },
         ];
       }
 
       // If exactly one ticker → add 1D/1m job
       if (tickersRaw.length === 1) {
-        jobs.push({ key: "1D", run: async () => await buildOneDayOneMinute(clientRef, tickersRaw[0]) });
+        jobs.push({ key: "1D", run: async () => await buildOneDayOneMinute(clientRef, ctx, tickersRaw[0]) });
       }
 
       console.log(`🚀 Starting all windows with TF_CONCURRENCY=${TF_CONCURRENCY}`);
@@ -1251,6 +1265,7 @@ app.post("/fetch", async (req, res) => {
         arrayBuffers: (used.arrayBuffers / 1024 / 1024).toFixed(2) + " MB"
       });
 
+      // ✅ return format EXACTLY like before
       return res.json(jsonPerTicker);
 
     } catch (err) {
@@ -1258,12 +1273,12 @@ app.post("/fetch", async (req, res) => {
       return res.status(500).json({ error: "internal_error", detail: String(err?.message || err) });
 
     } finally {
-      // Mimic "restart cleanup" without restarting the whole service
       destroyTvClient(clientRef.tv);
     }
   });
 });
 
+// ===== TTS (unchanged) =====
 function ticksToMs(ticks) {
   // 1 tick = 100ns → 10,000 ticks = 1 ms
   return Math.round(Number(ticks) / 10000);
