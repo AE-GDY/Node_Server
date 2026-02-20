@@ -1,3 +1,11 @@
+// ===============================
+// EGX/ADX Stock Data Server (FULL FILE)
+// - Adds optional `market` param to /fetch (default "EGX")
+// - If market === "ADX": uses "ADX:" prefix instead of "EGX:"
+// - If market === "ADX": uses "FAB" as reference ticker instead of "COMI"
+// - (Also switches TZ to Asia/Dubai for ADX; EGX stays Africa/Cairo)
+// ===============================
+
 const fs = require("fs");
 const path = require("path");
 const XLSX = require("xlsx");
@@ -17,7 +25,15 @@ app.use(cors());
 app.use(express.json());
 
 // ===== CONFIG =====
-const MARKET_SYM = (t) => (String(t).includes(":") ? String(t) : `EGX:${t}`);
+let MARKET_PREFIX = "EGX"; // ✅ default, overridden per-request in /fetch and /close
+const MARKET_TZ_MAP = {
+  EGX: "Africa/Cairo",
+  ADX: "Asia/Dubai",
+};
+
+// Uses current MARKET_PREFIX unless symbol already has a prefix
+const MARKET_SYM = (t) => (String(t).includes(":") ? String(t) : `${MARKET_PREFIX}:${t}`);
+
 const TICKER_CONCURRENCY = Number(process.env.TICKER_CONCURRENCY || 20);
 const TF_CONCURRENCY     = Number(process.env.TF_CONCURRENCY     || 6);
 
@@ -29,12 +45,13 @@ const INITIAL_BACKOFF_MS = Number(process.env.INITIAL_BACKOFF_MS || 500);
 
 const FILL_LEADING_DEFAULT = /^true$/i.test(process.env.FILL_LEADING || "true");
 
-const TZ = "Africa/Cairo";
+// ✅ timezone is set per request via MARKET_PREFIX
+let TZ = "Africa/Cairo";
 
-// EGX reference ticker for trading-day calendar
-const REF_TICKER = "COMI";
+// ✅ reference ticker set per request (EGX->COMI, ADX->FAB)
+let REF_TICKER = "COMI";
 
-// EGX local slots
+// EGX local slots (kept as-is)
 const DAY_15M_SLOTS = [
   "10:00:00","10:15:00","10:30:00","10:45:00","11:00:00","11:15:00","11:30:00","11:45:00",
   "12:00:00","12:15:00","12:30:00","12:45:00","13:00:00","13:15:00","13:30:00","13:45:00",
@@ -43,8 +60,9 @@ const DAY_15M_SLOTS = [
 const DAY_60M_SLOTS = ["10:00:00","11:00:00","12:00:00","13:00:00","14:00:00"];
 
 // ===== GLOBALS =====
-let GLOBAL_COMI_DAY = null;  // "yyyy-MM-dd" of latest COMI 1D
-let GLOBAL_COMI_TS  = null;  // epoch seconds of latest COMI bar
+// (kept names to preserve logic; now they track the current request’s REF_TICKER)
+let GLOBAL_COMI_DAY = null;  // "yyyy-MM-dd" of latest REF_TICKER 1D
+let GLOBAL_COMI_TS  = null;  // epoch seconds of latest REF_TICKER bar
 
 // ===== UTILS =====
 const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
@@ -59,6 +77,23 @@ function logEnvCheck() {
     `TICKER_CONCURRENCY=${TICKER_CONCURRENCY} TIMEOUT_DAILY_MS=${TIMEOUT_DAILY_MS} TIMEOUT_INTRADAY_MS=${TIMEOUT_INTRADAY_MS} ` +
     `MAX_RETRIES=${MAX_RETRIES}`
   );
+}
+
+function normalizeMarket(m) {
+  const v = String(m || "EGX").trim().toUpperCase();
+  return v === "ADX" ? "ADX" : "EGX";
+}
+
+function applyMarketContext(mkt) {
+  MARKET_PREFIX = mkt; // "EGX" or "ADX"
+  TZ = MARKET_TZ_MAP[mkt] || "Africa/Cairo";
+  REF_TICKER = (mkt === "ADX") ? "FAB" : "COMI";
+
+  // Reset per-request global anchors (since they depend on REF + TZ)
+  GLOBAL_COMI_DAY = null;
+  GLOBAL_COMI_TS  = null;
+
+  console.log(`🏛️ Market context: MARKET_PREFIX=${MARKET_PREFIX} REF_TICKER=${REF_TICKER} TZ=${TZ}`);
 }
 
 async function mapPool(items, limit, worker){
@@ -210,7 +245,7 @@ function calc1DRangeToCoverMonths(months){
   return { range: days, toUnix: Math.floor(end.toSeconds()) };
 }
 
-// ===== COMI PREFETCH =====
+// ===== COMI PREFETCH (now: REF_TICKER prefetch) =====
 async function prefetchGlobalComiLatest(clientRef) {
   const end = localNow().endOf("day");
   const toUnix = Math.floor(end.toSeconds());
@@ -221,13 +256,13 @@ async function prefetchGlobalComiLatest(clientRef) {
   let latestTs = 0, usedRange = null, barsGot = 0;
 
   for (const R of CANDIDATE_RANGES) {
-    console.log(`🧭 Prefetch COMI 1D (probe) to=${toUnix} range=${R}`);
+    console.log(`🧭 Prefetch ${REF_TICKER} 1D (probe) to=${toUnix} range=${R}`);
     const dBars = await fetchBarsOnce(clientRef, MARKET_SYM(REF_TICKER), {
       timeframe: "1D",
       range: R,
       toUnix,
       timeoutMs: TIMEOUT_DAILY_MS,
-      tag: "prefetch-comi"
+      tag: "prefetch-ref"
     });
 
     barsGot = dBars?.length || 0;
@@ -246,7 +281,7 @@ async function prefetchGlobalComiLatest(clientRef) {
   }
 
   if (!latestTs) {
-    console.warn("⚠️ COMI 1D prefetch returned empty across all probes.");
+    console.warn(`⚠️ ${REF_TICKER} 1D prefetch returned empty across all probes.`);
     GLOBAL_COMI_DAY = null;
     GLOBAL_COMI_TS  = null;
     return;
@@ -254,7 +289,7 @@ async function prefetchGlobalComiLatest(clientRef) {
 
   GLOBAL_COMI_TS  = latestTs;
   GLOBAL_COMI_DAY = DateTime.fromSeconds(latestTs, { zone: TZ }).toISODate();
-  console.log(`🧭 COMI latest (1D): ${GLOBAL_COMI_DAY} (ts=${latestTs}) via range=${usedRange}, bars=${barsGot}`);
+  console.log(`🧭 ${REF_TICKER} latest (1D): ${GLOBAL_COMI_DAY} (ts=${latestTs}) via range=${usedRange}, bars=${barsGot}`);
 }
 
 async function getLatestTradingDateFromCOMI(clientRef) {
@@ -300,12 +335,12 @@ async function buildOneDayOneMinute(clientRef, singleTickerRaw) {
 
   if (!GLOBAL_COMI_DAY) await prefetchGlobalComiLatest(clientRef);
   if (!GLOBAL_COMI_DAY) {
-    console.warn("⚠️ Could not detect COMI day; building empty 1D grid.");
+    console.warn(`⚠️ Could not detect ${REF_TICKER} day; building empty 1D grid.`);
     return { ["1D_1min_Union"]: [["DateTime", tk]] };
   }
 
   const todayYMD = GLOBAL_COMI_DAY;
-  console.log(`🧭 Latest COMI day (anchor): ${todayYMD}`);
+  console.log(`🧭 Latest ${REF_TICKER} day (anchor): ${todayYMD}`);
 
   const dayStart = DateTime.fromISO(`${todayYMD}T10:00:00`, { zone: TZ });
   const dayEnd   = DateTime.fromISO(`${todayYMD}T14:29:00`, { zone: TZ });
@@ -383,23 +418,23 @@ async function buildIntradayUnion(clientRef, tickersRaw, { tf, daysBack, label }
 
     const lastYMD = await getLatestTradingDateFromCOMI(clientRef);
     if (!lastYMD) {
-      console.warn(`⚠️ ${label}: cannot detect COMI latest day`);
+      console.warn(`⚠️ ${label}: cannot detect ${REF_TICKER} latest day`);
       return { [label]: [["DateTime", ...tickersRaw.map(t => (String(t).includes(":") ? String(t).split(":")[1] : String(t)).toUpperCase())]] };
     }
-    console.log(`🧭 ${label} latest COMI day: ${lastYMD}`);
+    console.log(`🧭 ${label} latest ${REF_TICKER} day: ${lastYMD}`);
 
     const lastDay   = DateTime.fromISO(lastYMD, { zone: TZ }).startOf("day");
     const anchorDay = lastDay.minus({ days: daysBack });
     const anchorKey = keyFor(anchorDay.toISODate(), EOD_SLOT);
 
-    // active days from COMI 1D
+    // active days from REF_TICKER 1D
     const { range: dRange, toUnix: dTo } = calc1DRangeToCoverMonths(2);
     const comi1d = await fetchBarsOnce(clientRef, MARKET_SYM(REF_TICKER), {
       timeframe: "1D",
       range: dRange,
       toUnix: dTo,
       timeoutMs: TIMEOUT_DAILY_MS,
-      tag: `${label}-comi-1d`
+      tag: `${label}-ref-1d`
     });
     const activeDays = new Set((comi1d || []).map(b => DateTime.fromSeconds(b.time, { zone: TZ }).toISODate()));
 
@@ -644,18 +679,18 @@ async function buildDailyTables(clientRef, tickers, years, label) {
 
   let comiMap;
   {
-    const hit = perTicker.find(x => x.ticker === "COMI");
+    const hit = perTicker.find(x => x.ticker === String(REF_TICKER).toUpperCase());
     if (hit && hit.map && hit.map.size) {
       comiMap = hit.map;
-      console.log(`🧭 Using COMI map from selected list`);
+      console.log(`🧭 Using ${REF_TICKER} map from selected list`);
     } else {
-      console.log(`🧭 Fetching COMI reference separately`);
+      console.log(`🧭 Fetching ${REF_TICKER} reference separately`);
       const bars = await fetchBarsOnce(clientRef, MARKET_SYM(REF_TICKER), {
         timeframe: "1D",
         range,
         toUnix,
         timeoutMs: TIMEOUT_DAILY_MS,
-        tag: `${label}-comi-ref`
+        tag: `${label}-ref`
       });
       comiMap = barsToDailyMapCairo(bars);
     }
@@ -784,18 +819,18 @@ async function buildSixMonthDaily(clientRef, tickers, label) {
 
   let comiMap;
   {
-    const hit = perTicker.find(x => x.ticker === "COMI");
+    const hit = perTicker.find(x => x.ticker === String(REF_TICKER).toUpperCase());
     if (hit && hit.map && hit.map.size) {
       comiMap = hit.map;
-      console.log(`🧭 Using COMI map from selected list`);
+      console.log(`🧭 Using ${REF_TICKER} map from selected list`);
     } else {
-      console.log(`🧭 Fetching COMI reference separately`);
+      console.log(`🧭 Fetching ${REF_TICKER} reference separately`);
       const bars = await fetchBarsOnce(clientRef, MARKET_SYM(REF_TICKER), {
         timeframe: "1D",
         range,
         toUnix,
         timeoutMs: TIMEOUT_DAILY_MS,
-        tag: `${label}-comi-ref`
+        tag: `${label}-ref`
       });
       comiMap = barsToDailyMapCairo(bars);
     }
@@ -955,7 +990,7 @@ function parseYMD(dateStr) {
 async function getCloseOnOrBeforeDate(clientRef, tickerRaw, ymd, { fallbackToPrevTradingDay = true } = {}) {
   const sym = MARKET_SYM(tickerRaw);
 
-  // Use end of requested day (Cairo) as "to"
+  // Use end of requested day (local TZ) as "to"
   const targetEnd = DateTime.fromISO(ymd, { zone: TZ }).endOf("day");
   const toUnix = Math.floor(targetEnd.toSeconds());
 
@@ -1024,7 +1059,7 @@ async function getClosesForDates(clientRef, tickerRaw, ymdList, { fallbackToPrev
   const minYMD = ymdList[0];
   const maxYMD = ymdList[ymdList.length - 1];
 
-  // Fetch up to end of max day (Cairo)
+  // Fetch up to end of max day (local TZ)
   const maxEnd = DateTime.fromISO(maxYMD, { zone: TZ }).endOf("day");
   const toUnix = Math.floor(maxEnd.toSeconds());
 
@@ -1069,17 +1104,20 @@ async function getClosesForDates(clientRef, tickerRaw, ymdList, { fallbackToPrev
   for (const ymd of ymdList) {
     const r = resolveOne(ymd);
     // EXACT format you requested: only close.
-    // If you also want resolvedDate, just include it below.
     out[ymd] = { close: r.close };
-    // out[ymd] = { close: r.close, resolvedDate: r.resolvedDate }; // optional
   }
 
   return out;
 }
 
+// ===== /close (kept same; added optional market for consistency with new global prefix) =====
 app.post("/close", async (req, res) => {
   return withRequestLock(async () => {
-    const { ticker, tickers, date, dates, fallback } = req.body || {};
+    const { market, ticker, tickers, date, dates, fallback } = req.body || {};
+
+    // ✅ Default EGX; if provided, apply market context so prefix/ref/tz match
+    const mkt = normalizeMarket(market);
+    applyMarketContext(mkt);
 
     const tickersIn =
       Array.isArray(tickers) && tickers.length
@@ -1140,6 +1178,7 @@ app.post("/close", async (req, res) => {
       }
 
       return res.json({
+        market: mkt,
         fallback: fallbackToPrevTradingDay,
         results
       });
@@ -1174,7 +1213,10 @@ app.post("/fetch", async (req, res) => {
       const startAll = Date.now();
       logEnvCheck();
 
-      const { tickersRaw } = req.body;
+      // ✅ NEW: optional market param (default EGX)
+      const { tickersRaw, market } = req.body;
+      const mkt = normalizeMarket(market);
+      applyMarketContext(mkt);
 
       if (!Array.isArray(tickersRaw) || tickersRaw.length === 0) {
         return res.status(400).json({ error: "tickersRaw is required (non-empty array)" });
@@ -1195,7 +1237,7 @@ app.post("/fetch", async (req, res) => {
 
       console.log(`🎯 Tickers: ${tickersRaw.join(", ")}`);
 
-      // Prefetch COMI once (uses daily timeout + restart-like recovery)
+      // Prefetch REF_TICKER once (COMI for EGX, FAB for ADX)
       await prefetchGlobalComiLatest(clientRef);
 
       const tickers = tickersRaw.map(t => (String(t).includes(":") ? String(t).split(":")[1] : String(t)).toUpperCase());
@@ -1251,6 +1293,7 @@ app.post("/fetch", async (req, res) => {
         arrayBuffers: (used.arrayBuffers / 1024 / 1024).toFixed(2) + " MB"
       });
 
+      // include market in response? (doesn't change your structure; keeping it identical)
       return res.json(jsonPerTicker);
 
     } catch (err) {
