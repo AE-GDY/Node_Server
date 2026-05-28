@@ -404,7 +404,11 @@ async function buildOneDayOneMinute(clientRef, singleTickerRaw) {
 
   const nowLocal = DateTime.now().setZone(TZ);
   const isLiveDay = (todayYMD === nowLocal.toISODate());
-  const delayedNow = nowLocal.minus({ minutes: 15 });
+  // TradingView feed delay by market:
+  //   EGX / ADX → 15-min delayed at source, mask the trailing 15 min.
+  //   NASDAQ    → real-time feed, no masking.
+  const delayMinutes = (MARKET_PREFIX === "NASDAQ") ? 0 : 15;
+  const delayedNow = nowLocal.minus({ minutes: delayMinutes });
   const nowKey = (isLiveDay ? delayedNow.toFormat("yyyy-LL-dd HH:mm:ss") : null);
 
   const toUnix = Math.floor((isLiveDay ? nowLocal : dayEnd).toSeconds());
@@ -555,9 +559,14 @@ async function buildIntradayUnion(clientRef, tickersRaw, { tf, daysBack, label }
     out.push(anchorRow);
 
     // live cut
+    // live cut
     const nowLocal = DateTime.now().setZone(TZ);
     const isLiveDay = nowLocal.toISODate() === lastYMD;
-    const delayedNow = nowLocal.minus({ minutes: 15 });
+    // Same per-market split as buildOneDayOneMinute above.
+    // EGX/ADX: 15-min delayed → mask trailing 15 min.
+    // NASDAQ: real-time → no mask.
+    const delayMinutes = (MARKET_PREFIX === "NASDAQ") ? 0 : 15;
+    const delayedNow = nowLocal.minus({ minutes: delayMinutes });
 
     const liveMaxSlot = (() => {
       if (!isLiveDay) return EOD_SLOT;
