@@ -38,14 +38,17 @@ let MARKET_PREFIX = "EGX"; // default, overridden per-request in /fetch and /clo
 const MARKET_TZ_MAP = {
   EGX: "Africa/Cairo",
   ADX: "Asia/Dubai",
+  NASDAQ: "America/New_York",
 };
 
 // ✅ Market benchmark by market (edit ADXGI if your TradingView symbol differs)
 const BENCHMARK_BY_MARKET = {
   EGX: "EGX30",
   ADX: "FADGI",
+  // US benchmark: S&P 500. Pre-prefixed with the correct TradingView exchange
+  // ("SP:") so MARKET_SYM passes it through unchanged.
+  NASDAQ: "SP:SPX",
 };
-
 // Uses current MARKET_PREFIX unless symbol already has a prefix
 const MARKET_SYM = (t) => (String(t).includes(":") ? String(t) : `${MARKET_PREFIX}:${t}`);
 
@@ -74,6 +77,30 @@ const DAY_15M_SLOTS = [
 ];
 const DAY_60M_SLOTS = ["10:00:00", "11:00:00", "12:00:00", "13:00:00", "14:00:00"];
 
+// US session slots (NYSE/NASDAQ: 09:30 → 16:00 ET)
+const DAY_15M_SLOTS_US = [
+  "09:30:00", "09:45:00",
+  "10:00:00", "10:15:00", "10:30:00", "10:45:00",
+  "11:00:00", "11:15:00", "11:30:00", "11:45:00",
+  "12:00:00", "12:15:00", "12:30:00", "12:45:00",
+  "13:00:00", "13:15:00", "13:30:00", "13:45:00",
+  "14:00:00", "14:15:00", "14:30:00", "14:45:00",
+  "15:00:00", "15:15:00", "15:30:00", "15:45:00"
+];
+const DAY_60M_SLOTS_US = [
+  "10:00:00", "11:00:00", "12:00:00", "13:00:00",
+  "14:00:00", "15:00:00", "16:00:00"
+];
+
+// Returns the appropriate slot list based on the current MARKET_PREFIX.
+// EGX/ADX → existing Cairo-hour slots (no behavior change).
+// NASDAQ  → US session slots.
+function slotsForCurrentMarket(tfStr) {
+  const isUS = MARKET_PREFIX === "NASDAQ";
+  if (tfStr === "15") return isUS ? DAY_15M_SLOTS_US : DAY_15M_SLOTS;
+  if (tfStr === "60") return isUS ? DAY_60M_SLOTS_US : DAY_60M_SLOTS;
+  return null;
+}
 // ===== GLOBALS =====
 // (kept names to preserve logic; now they track the current request’s REF_TICKER)
 let GLOBAL_COMI_DAY = null; // "yyyy-MM-dd" of latest REF_TICKER 1D
@@ -96,13 +123,20 @@ function logEnvCheck() {
 
 function normalizeMarket(m) {
   const v = String(m || "EGX").trim().toUpperCase();
-  return v === "ADX" ? "ADX" : "EGX";
+  if (v === "ADX") return "ADX";
+  // Accept "america" (matches Python rag.py default), "us", or "nasdaq"
+  // as aliases for the US market. Internally we use "NASDAQ" because
+  // it doubles as the MARKET_PREFIX for TradingView symbols.
+  if (v === "AMERICA" || v === "US" || v === "NASDAQ") return "NASDAQ";
+  return "EGX";
 }
 
 function applyMarketContext(mkt) {
-  MARKET_PREFIX = mkt; // "EGX" or "ADX"
+  MARKET_PREFIX = mkt; // "EGX", "ADX", or "NASDAQ"
   TZ = MARKET_TZ_MAP[mkt] || "Africa/Cairo";
-  REF_TICKER = (mkt === "ADX") ? "FAB" : "COMI";
+  REF_TICKER = (mkt === "ADX") ? "FAB"
+             : (mkt === "NASDAQ") ? "AAPL"   // liquid NASDAQ reference for latest-trading-day anchor
+             : "COMI";
 
   // Reset per-request global anchors (since they depend on REF + TZ)
   GLOBAL_COMI_DAY = null;
@@ -110,7 +144,6 @@ function applyMarketContext(mkt) {
 
   console.log(`🏛️ Market context: MARKET_PREFIX=${MARKET_PREFIX} REF_TICKER=${REF_TICKER} TZ=${TZ}`);
 }
-
 async function mapPool(items, limit, worker) {
   const results = new Array(items.length);
   let idx = 0, active = 0;
@@ -354,8 +387,14 @@ async function buildOneDayOneMinute(clientRef, singleTickerRaw) {
   const todayYMD = GLOBAL_COMI_DAY;
   console.log(`🧭 Latest ${REF_TICKER} day (anchor): ${todayYMD}`);
 
-  const dayStart = DateTime.fromISO(`${todayYMD}T10:00:00`, { zone: TZ });
-  const dayEnd = DateTime.fromISO(`${todayYMD}T14:29:00`, { zone: TZ });
+  // Session hours per market.
+  //   EGX/ADX: 10:00 → 14:29 Cairo/Dubai
+  //   NASDAQ : 09:30 → 15:59 ET
+  const SESSION_START = (MARKET_PREFIX === "NASDAQ") ? "09:30:00" : "10:00:00";
+  const SESSION_END   = (MARKET_PREFIX === "NASDAQ") ? "15:59:00" : "14:29:00";
+
+  const dayStart = DateTime.fromISO(`${todayYMD}T${SESSION_START}`, { zone: TZ });
+  const dayEnd = DateTime.fromISO(`${todayYMD}T${SESSION_END}`, { zone: TZ });
 
   const allKeys = [];
   for (let t = dayStart; t <= dayEnd; t = t.plus({ minutes: 1 })) {
@@ -372,7 +411,11 @@ async function buildOneDayOneMinute(clientRef, singleTickerRaw) {
   const RANGE = 3000;
 
   console.log(`➡️  Fetching ${tk} 1m range=${RANGE} to=${toUnix}`);
-  const bars = await fetchBarsOnce(clientRef, MARKET_SYM(tk), {
+  // Pass the ORIGINAL prefixed ticker to MARKET_SYM so already-prefixed
+  // symbols (e.g. "NASDAQ:TSLA") pass through unchanged. Using bare `tk`
+  // (after the prefix strip above) would cause MARKET_SYM to re-prefix
+  // with MARKET_PREFIX, producing "EGX:TSLA" on US fetches.
+  const bars = await fetchBarsOnce(clientRef, MARKET_SYM(singleTickerRaw), {
     timeframe: "1",
     range: RANGE,
     toUnix,
@@ -419,13 +462,15 @@ async function buildIntradayUnion(clientRef, tickersRaw, { tf, daysBack, label }
   try {
     console.log(`📊 Build start: ${label} for ${tickersRaw.length} tickers (tf=${tfStr})`);
 
-    const SLOT_LIST = tfStr === "15"
-      ? DAY_15M_SLOTS
-      : tfStr === "60"
-        ? DAY_60M_SLOTS
-        : (() => { throw new Error(`Unsupported tf=${tfStr} (expected "15" or "60")`); })();
+    const SLOT_LIST = slotsForCurrentMarket(tfStr);
+    if (!SLOT_LIST) {
+      throw new Error(`Unsupported tf=${tfStr} (expected "15" or "60")`);
+    }
 
-    const EOD_SLOT = tfStr === "15" ? "14:15:00" : "14:00:00";
+    // EOD_SLOT is the final slot of the session for the current market.
+    //   EGX 15m → "14:15:00", EGX 60m → "14:00:00"   (matches previous hardcoded values)
+    //   US 15m  → "15:45:00", US 60m  → "16:00:00"
+    const EOD_SLOT = SLOT_LIST[SLOT_LIST.length - 1];
     const keyFor = (ymd, hhmmss) => `${ymd} ${hhmmss}`;
 
     const lastYMD = await getLatestTradingDateFromCOMI(clientRef);
@@ -1180,10 +1225,18 @@ app.post("/fetch", async (req, res) => {
       if (tickersRaw.length > 1 && benchmark) {
         includeBenchmark = true;
 
+        // Compare against the BARE benchmark base so pre-prefixed
+        // benchmarks like "SP:SPX" don't false-negative against
+        // already-stripped ticker bases (e.g. "SPX").
+        const benchUpperFull = String(benchmark).toUpperCase();
+        const benchBase = benchUpperFull.includes(":")
+          ? benchUpperFull.split(":")[1]
+          : benchUpperFull;
+
         const hasBenchmarkAlready = tickersRaw.some(t => {
           const raw = String(t).toUpperCase();
           const base = raw.includes(":") ? raw.split(":")[1] : raw;
-          return base === String(benchmark).toUpperCase();
+          return base === benchBase;
         });
 
         if (!hasBenchmarkAlready) tickersRaw.push(benchmark);
@@ -1205,13 +1258,20 @@ app.post("/fetch", async (req, res) => {
       let jobs;
 
       if (includeBenchmark && benchmark) {
-        const benchUpper = String(benchmark).toUpperCase();
+        // Same bare-base comparison as above, so "SP:SPX" filters out
+        // ticker entries whose base is "SPX". For EGX where benchmark
+        // is "EGX30" (no colon), benchBaseLocal === benchUpperLocal,
+        // so behavior is identical to the previous hardcoded form.
+        const benchUpperLocal = String(benchmark).toUpperCase();
+        const benchBaseLocal = benchUpperLocal.includes(":")
+          ? benchUpperLocal.split(":")[1]
+          : benchUpperLocal;
 
         // mainTickers excludes benchmark (benchmark handled by a dedicated 5Y daily-only job)
         const mainTickers = tickersRaw.filter(t => {
           const raw = String(t).toUpperCase();
           const base = raw.includes(":") ? raw.split(":")[1] : raw;
-          return base !== benchUpper;
+          return base !== benchBaseLocal;
         });
 
         jobs = [
