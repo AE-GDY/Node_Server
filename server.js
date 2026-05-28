@@ -282,13 +282,15 @@ function calc1DRangeToCoverYears(years) {
   const end = localNow().endOf("day");
   const start = end.minus({ years });
   const days = Math.max(1, Math.round(end.diff(start, "days").days)) + 15;
-  return { range: days, toUnix: Math.floor(end.toSeconds()) };
+  const nowUnix = Math.floor(localNow().toSeconds());
+  return { range: days, toUnix: Math.min(Math.floor(end.toSeconds()), nowUnix) };
 }
 function calc1DRangeToCoverMonths(months) {
   const end = localNow().endOf("day");
   const start = end.minus({ months });
   const days = Math.max(1, Math.round(end.diff(start, "days").days)) + 10;
-  return { range: days, toUnix: Math.floor(end.toSeconds()) };
+  const nowUnix = Math.floor(localNow().toSeconds());
+  return { range: days, toUnix: Math.min(Math.floor(end.toSeconds()), nowUnix) };
 }
 
 // ===== REF PREFETCH =====
@@ -1077,7 +1079,8 @@ async function getClosesForDates(clientRef, tickerRaw, ymdList, { fallbackToPrev
   const maxYMD = ymdList[ymdList.length - 1];
 
   const maxEnd = DateTime.fromISO(maxYMD, { zone: TZ }).endOf("day");
-  const toUnix = Math.floor(maxEnd.toSeconds());
+  const nowUnix = Math.floor(localNow().toSeconds());
+  const toUnix = Math.min(Math.floor(maxEnd.toSeconds()), nowUnix);
 
   const spanDays = daysBetweenInclusive(minYMD, maxYMD);
   const RANGE = spanDays + 40;
