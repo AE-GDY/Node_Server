@@ -1206,6 +1206,78 @@ app.post("/close", async (req, res) => {
   });
 });
 
+// ===== /live-tick =====
+// Latest 1-minute bar close per ticker via TV WebSocket. Used by
+// rag.py as the fallback for tickers TV's screener has dropped from
+// its index but that still have chart data on the WebSocket (e.g.
+// EGX:MMAT, EGX:SAIB). Reuses fetchBarsOnce so it inherits retry /
+// timeout / client-recreation behavior.
+app.post("/live-tick", async (req, res) => {
+  return withRequestLock(async () => {
+    const { market, tickers } = req.body || {};
+    const mkt = normalizeMarket(market);
+    applyMarketContext(mkt);
+
+    const tickersIn = Array.isArray(tickers) ? tickers : [];
+    if (!tickersIn.length) {
+      return res.status(400).json({
+        error: "missing_params",
+        detail:
+          'Required JSON body: { "tickers": ["MMAT","SAIB"], "market": "egypt" }',
+      });
+    }
+
+    const clientRef = { tv: createTvClient() };
+
+    try {
+      const LIVE_CONCURRENCY = Number(process.env.LIVE_CONCURRENCY || 6);
+      const nowUnix = Math.floor(localNow().toSeconds());
+
+      const resultsArr = await mapPool(tickersIn, LIVE_CONCURRENCY, async (t) => {
+        const normalizedTicker = (String(t).includes(":")
+          ? String(t).split(":")[1]
+          : String(t)
+        ).toUpperCase();
+
+        const sym = MARKET_SYM(String(t));
+        const bars = await fetchBarsOnce(clientRef, sym, {
+          timeframe: "1",
+          range: 5,
+          toUnix: nowUnix,
+          timeoutMs: 10000,
+          tag: `live-tick:${normalizedTicker}`,
+        });
+
+        if (!bars || !bars.length) {
+          return { ticker: normalizedTicker, close: null };
+        }
+        const lastBar = bars[bars.length - 1];
+        return {
+          ticker: normalizedTicker,
+          close: lastBar.close,
+          time: lastBar.time,
+        };
+      });
+
+      const results = {};
+      for (const r of resultsArr) {
+        if (!r || !r.ticker) continue;
+        results[r.ticker] = { close: r.close, time: r.time };
+      }
+
+      return res.json({ market: mkt, results });
+    } catch (err) {
+      console.error("❌ /live-tick failed:", err);
+      return res.status(500).json({
+        error: "internal_error",
+        detail: String(err?.message || err),
+      });
+    } finally {
+      destroyTvClient(clientRef.tv);
+    }
+  });
+});
+
 // ===== MAIN ROUTE =====
 app.post("/fetch", async (req, res) => {
   console.log("SESSION:", process.env.SESSION?.slice(0, 6), "...", process.env.SESSION?.length);
