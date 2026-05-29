@@ -256,11 +256,7 @@ async function fetchBarsOnce(clientRef, symbol, { timeframe, range, toUnix, time
       const msg = String(e?.message || e);
       console.log(`❌ Fetch error ${symbol} [tf=${timeframe}] attempt ${attempt}/${MAX_RETRIES}: ${msg}${tag ? ` (${tag})` : ""}`);
 
-      if (isRecoverableTvError(e) && attempt < MAX_RETRIES) {
-        console.log(`🔄 Recreating TradingView client to recover... (attempt ${attempt}/${MAX_RETRIES})`);
-        try { destroyTvClient(clientRef.tv); } catch { }
-        clientRef.tv = createTvClient();
-      }
+
 
       if (attempt >= MAX_RETRIES) return [];
 
