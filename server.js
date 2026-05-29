@@ -1281,7 +1281,23 @@ app.post("/fetch", async (req, res) => {
   console.log("PID:", process.pid);
 
   return withRequestLock(async () => {
-    const clientRef = { tv: createTvClient() };
+    // ── Hybrid client pool ──
+    // For ≤40 tickers: 1 shared client (current behavior — empirically
+    //   faster setup at small scale, no cliff risk).
+    // For >40 tickers: 1 client per timeframe job. TV's session limit
+    //   is cumulative per Client (~200 sessions before
+    //   'max sessions rate reached'). At 60 tickers × 5 timeframes =
+    //   300 sessions, a single shared client trips that limit and we
+    //   see ~50-60% subscription failures + cascading timeouts.
+    // Empirical results (see _test_node/test_hybrid.js):
+    //   40 tickers, 1 client : 4.7s, 100% success
+    //   45 tickers, 1 client : 29.1s, 60% FAIL
+    //   60 tickers, 1 client : 26.9s, 57% FAIL
+    //   60 tickers, 5 clients: 5.0s, 100% success
+    // The pool is created lazily after we know the job count.
+    const POOL_THRESHOLD = 40;
+    const clientPool = [{ tv: createTvClient() }];
+    const clientRef = clientPool[0];
 
     try {
       console.log("Before building:", (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2), "MB");
@@ -1355,35 +1371,53 @@ app.post("/fetch", async (req, res) => {
         });
 
         jobs = [
-          { key: "5Y", run: async () => await buildDailyTables(clientRef, mainTickers, 5, "5Y") },
-          { key: "1Y", run: async () => await buildDailyTables(clientRef, mainTickers, 1, "1Y") },
-          { key: "6M", run: async () => await buildSixMonthDaily(clientRef, mainTickers, "6M") },
-          { key: "1M", run: async () => await buildIntradayUnion(clientRef, mainTickers, { tf: "60", daysBack: 28, label: "1M_Hourly_Union" }) },
-          { key: "1W", run: async () => await buildIntradayUnion(clientRef, mainTickers, { tf: "15", daysBack: 7, label: "1W_15min_Union" }) },
+          { key: "5Y", run: async (cli) => await buildDailyTables(cli, mainTickers, 5, "5Y") },
+          { key: "1Y", run: async (cli) => await buildDailyTables(cli, mainTickers, 1, "1Y") },
+          { key: "6M", run: async (cli) => await buildSixMonthDaily(cli, mainTickers, "6M") },
+          { key: "1M", run: async (cli) => await buildIntradayUnion(cli, mainTickers, { tf: "60", daysBack: 28, label: "1M_Hourly_Union" }) },
+          { key: "1W", run: async (cli) => await buildIntradayUnion(cli, mainTickers, { tf: "15", daysBack: 7, label: "1W_15min_Union" }) },
 
           // ✅ Benchmark 5Y daily only
-          { key: "5Y_BENCH_ONLY", run: async () => await buildDailyTables(clientRef, [benchmark], 5, "5Y_BENCH_ONLY") },
+          { key: "5Y_BENCH_ONLY", run: async (cli) => await buildDailyTables(cli, [benchmark], 5, "5Y_BENCH_ONLY") },
         ];
       } else {
         jobs = [
-          { key: "5Y", run: async () => await buildDailyTables(clientRef, tickersRaw, 5, "5Y") },
-          { key: "1Y", run: async () => await buildDailyTables(clientRef, tickersRaw, 1, "1Y") },
-          { key: "6M", run: async () => await buildSixMonthDaily(clientRef, tickersRaw, "6M") },
-          { key: "1M", run: async () => await buildIntradayUnion(clientRef, tickersRaw, { tf: "60", daysBack: 28, label: "1M_Hourly_Union" }) },
-          { key: "1W", run: async () => await buildIntradayUnion(clientRef, tickersRaw, { tf: "15", daysBack: 7, label: "1W_15min_Union" }) },
+          { key: "5Y", run: async (cli) => await buildDailyTables(cli, tickersRaw, 5, "5Y") },
+          { key: "1Y", run: async (cli) => await buildDailyTables(cli, tickersRaw, 1, "1Y") },
+          { key: "6M", run: async (cli) => await buildSixMonthDaily(cli, tickersRaw, "6M") },
+          { key: "1M", run: async (cli) => await buildIntradayUnion(cli, tickersRaw, { tf: "60", daysBack: 28, label: "1M_Hourly_Union" }) },
+          { key: "1W", run: async (cli) => await buildIntradayUnion(cli, tickersRaw, { tf: "15", daysBack: 7, label: "1W_15min_Union" }) },
         ];
       }
 
       // If exactly one ticker → add 1D/1m job
       if (tickersRaw.length === 1) {
-        jobs.push({ key: "1D", run: async () => await buildOneDayOneMinute(clientRef, tickersRaw[0]) });
+        jobs.push({ key: "1D", run: async (cli) => await buildOneDayOneMinute(cli, tickersRaw[0]) });
+      }
+
+      // ── Expand client pool when ticker count exceeds threshold ──
+      // Creates one additional client per remaining job, with a 100ms
+      // throttle between creations to avoid TV's HTTP 429 rate limit
+      // on WebSocket-upgrade handshakes. Without the throttle, ~half
+      // the new clients fail to connect with 429.
+      if (tickersRaw.length > POOL_THRESHOLD) {
+        for (let i = 1; i < jobs.length; i++) {
+          clientPool.push({ tv: createTvClient() });
+          if (i < jobs.length - 1) await sleep(100);
+        }
+        console.log(`🏊 Pool expanded to ${clientPool.length} clients for ${tickersRaw.length} tickers`);
+      } else {
+        console.log(`🏊 Single shared client for ${tickersRaw.length} tickers`);
       }
 
       console.log(`🚀 Starting all windows with TF_CONCURRENCY=${TF_CONCURRENCY}`);
-      const allTables = await mapPool(jobs, TF_CONCURRENCY, async (j) => {
+      const allTables = await mapPool(jobs, TF_CONCURRENCY, async (j, i) => {
+        // Each job gets its own client when the pool is expanded;
+        // otherwise all jobs share clientPool[0] (the legacy path).
+        const cli = clientPool[i] || clientPool[0];
         const s = Date.now();
         console.log(`➡️  Window start: ${j.key}`);
-        const out = await j.run();
+        const out = await j.run(cli);
         console.log(`✅ Window done:  ${j.key} in ${Date.now() - s} ms`);
         return out;
       });
@@ -1412,7 +1446,11 @@ app.post("/fetch", async (req, res) => {
       return res.status(500).json({ error: "internal_error", detail: String(err?.message || err) });
 
     } finally {
-      destroyTvClient(clientRef.tv);
+      // Destroy every client in the pool. When ≤40 tickers,
+      // clientPool has only 1 entry (same as legacy behavior).
+      for (const c of clientPool) {
+        try { destroyTvClient(c.tv); } catch {}
+      }
     }
   });
 });
